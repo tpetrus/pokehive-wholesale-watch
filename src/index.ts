@@ -8,6 +8,8 @@ export interface Env {
   ANTHROPIC_API_KEY: string;
   PUSHOVER_USER_KEY: string;
   PUSHOVER_APP_TOKEN: string;
+  /** Separate Pushover app for failure alerts; falls back to PUSHOVER_APP_TOKEN. */
+  PUSHOVER_ERROR_APP_KEY?: string;
   LOGIN_URL: string;
   SOURCE_URL: string;
   DEFAULT_TIMEZONE: string;
@@ -80,16 +82,17 @@ async function pushoverSend(
   env: Env,
   title: string,
   message: string,
-  urgent: boolean,
+  isError: boolean,
 ): Promise<boolean> {
   const params = new URLSearchParams({
-    token: env.PUSHOVER_APP_TOKEN?.trim() ?? "",
+    token: (isError ? env.PUSHOVER_ERROR_APP_KEY?.trim() : "") || env.PUSHOVER_APP_TOKEN?.trim() || "",
     user: env.PUSHOVER_USER_KEY?.trim() ?? "",
     title: title.slice(0, 250),
     message,
   });
-  // Errors get high priority (bypasses quiet hours) and a distinct sound.
-  if (urgent) {
+  // Errors go out under their own Pushover app, at high priority (bypasses quiet
+  // hours) with a distinct sound.
+  if (isError) {
     params.set("priority", "1");
     params.set("sound", "siren");
   }
@@ -118,7 +121,7 @@ async function notify(
   env: Env,
   title: string,
   body: string,
-  urgent = false,
+  isError = false,
 ): Promise<boolean> {
   const chunks = chunkByLines(body, PUSHOVER_MAX_MESSAGE_CHARS);
   const sent = chunks.slice(0, PUSHOVER_MAX_MESSAGES);
@@ -129,7 +132,7 @@ async function notify(
   }
   for (let i = 0; i < sent.length; i++) {
     const partTitle = sent.length > 1 ? `${title} (${i + 1}/${sent.length})` : title;
-    if (!(await pushoverSend(env, partTitle, sent[i], urgent))) return false;
+    if (!(await pushoverSend(env, partTitle, sent[i], isError))) return false;
   }
   return true;
 }
@@ -570,6 +573,19 @@ export default {
   async fetch(request: Request, env: Env): Promise<Response> {
     const url = new URL(request.url);
     const timeZone = (request.cf?.timezone as string | undefined) ?? env.DEFAULT_TIMEZONE;
+
+    if (url.pathname === "/test-error-alert") {
+      const delivered = await notify(
+        env,
+        "PokeHive watch: test error alert",
+        "WARNING\nThis is a test of the failure-alert channel.",
+        true,
+      );
+      return new Response(delivered ? "Test error alert sent." : "Test error alert FAILED.", {
+        status: delivered ? 200 : 502,
+        headers: { "content-type": "text/plain" },
+      });
+    }
 
     if (url.pathname === "/run") {
       const summary = await runCheck(env, timeZone);

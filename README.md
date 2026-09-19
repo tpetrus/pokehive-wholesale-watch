@@ -78,7 +78,8 @@ could shift between the two screenshots as the list grows or shrinks.
   *not* advanced, so the same changes are re-detected and re-sent on the
   next run, and a "notification failed" alert is attempted.
 
-All failure alerts are sent at Pushover high priority with the siren sound so
+All failure alerts are sent under a separate Pushover app (`PUSHOVER_ERROR_APP_KEY`)
+at high priority with the siren sound so
 they stand out from normal list updates.
 
 ## Notifications
@@ -104,6 +105,7 @@ wrangler secret put POKEHIVE_PASSWORD
 wrangler secret put ANTHROPIC_API_KEY
 wrangler secret put PUSHOVER_USER_KEY    # your user key, from the Pushover dashboard
 wrangler secret put PUSHOVER_APP_TOKEN   # API token of an app created at pushover.net/apps/build
+wrangler secret put PUSHOVER_ERROR_APP_KEY  # API token of a second app, used only for failure alerts
 ```
 
 `ANTHROPIC_API_KEY` is a real Anthropic API key from
@@ -125,6 +127,7 @@ npm run tail     # stream logs from the deployed worker
 
 - `GET /` — status: last check time + product counts per section.
 - `GET /run` — manually trigger a check (same logic as the cron; sends real notifications and updates the snapshot).
+- `GET /test-error-alert` — send a test alert through the failure-alert channel (separate Pushover app, high priority).
 
 ## Storage
 
