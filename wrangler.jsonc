@@ -1,0 +1,30 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "pokehive-wholesale-watch",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-09-11",
+  "compatibility_flags": ["nodejs_compat"],
+  "triggers": {
+    // Runs hourly every day; the scheduled handler itself gates on
+    // 10am-8pm Eastern, Mon-Fri (see isWithinWorkingHours) so a browser
+    // is only launched during the actual check window.
+    "crons": ["0 * * * *"]
+  },
+  "observability": {
+    "enabled": true
+  },
+  "browser": {
+    "binding": "BROWSER"
+  },
+  "kv_namespaces": [
+    {
+      "binding": "SNAPSHOTS",
+      "id": "8d4c86df22aa4329be25a86ecdc8a55f"
+    }
+  ],
+  "vars": {
+    "LOGIN_URL": "https://www.thepokehivewholesale.com/account/login",
+    "SOURCE_URL": "https://www.thepokehivewholesale.com/member-site-homepage-2-2-1",
+    "DEFAULT_TIMEZONE": "America/New_York"
+  }
+}
