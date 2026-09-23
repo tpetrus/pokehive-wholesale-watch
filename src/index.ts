@@ -231,7 +231,16 @@ async function discoverImages(env: Env): Promise<DiscoveredImages> {
     await loginFrame.type("#login-password", env.POKEHIVE_PASSWORD);
     await Promise.all([
       page.waitForNavigation({ waitUntil: "networkidle0", timeout: 20000 }),
-      loginFrame.click("button[type=submit]"),
+      // The submit click can race the resulting top-level navigation, which
+      // tears down/replaces this iframe before the click command's own
+      // confirmation comes back — Puppeteer then reports "Navigating frame
+      // was detached" even though login succeeded. That's benign here since
+      // page.waitForNavigation (and the login-page check below) are what
+      // actually gate success; only a genuinely different click failure
+      // should abort the run.
+      loginFrame.click("button[type=submit]").catch((e) => {
+        if (!/detached/i.test((e as Error).message)) throw e;
+      }),
     ]);
 
     if (page.url().includes("/account/login")) {
