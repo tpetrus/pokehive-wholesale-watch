@@ -34,6 +34,9 @@ interface StoredState {
   fetchedAt: string;
   mainList: SectionState;
   preOrders: SectionState;
+  /** Eastern calendar date (YYYY-MM-DD) a change was last found and notified;
+   *  scheduled checks are skipped for the rest of that date. */
+  lastChangeDate?: string;
 }
 
 const EMPTY_SECTION: SectionState = { imageIds: [], products: {} };
@@ -165,6 +168,16 @@ function isWithinWorkingHours(date: Date, timeZone: string): boolean {
   const weekday = parts.find((p) => p.type === "weekday")?.value;
   const isWeekday = weekday !== "Sat" && weekday !== "Sun";
   return isWeekday && hour >= WORKING_HOURS_START && hour < WORKING_HOURS_END;
+}
+
+/** YYYY-MM-DD calendar date for `date` as observed in `timeZone`. */
+function dateStringInTimeZone(date: Date, timeZone: string): string {
+  return new Intl.DateTimeFormat("en-CA", {
+    timeZone,
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+  }).format(date);
 }
 
 // ---------------------------------------------------------------------------
@@ -509,11 +522,13 @@ async function runCheck(env: Env, timeZone: string = env.DEFAULT_TIMEZONE): Prom
     await notify(env, "PokeHive watch: extraction failed", `WARNING\n${msg}`);
   }
 
-  const now = new Date().toISOString();
+  const nowDate = new Date();
+  const now = nowDate.toISOString();
   const newState: StoredState = {
     fetchedAt: now,
     mainList: mainListSection,
     preOrders: preOrdersSection,
+    lastChangeDate: stored.lastChangeDate,
   };
   const saveState = () => env.SNAPSHOTS.put("state", JSON.stringify(newState));
 
@@ -562,6 +577,8 @@ async function runCheck(env: Env, timeZone: string = env.DEFAULT_TIMEZONE): Prom
     await notifyError(env, "PokeHive watch: notification failed", msg);
     return msg;
   }
+  // A change was successfully notified — no need to keep polling today.
+  newState.lastChangeDate = dateStringInTimeZone(nowDate, env.DEFAULT_TIMEZONE);
   await saveState();
 
   return `${changeCount} changes found and notified at ${formatTimestamp(now, timeZone)}.`;
@@ -569,13 +586,22 @@ async function runCheck(env: Env, timeZone: string = env.DEFAULT_TIMEZONE): Prom
 
 export default {
   async scheduled(_event: ScheduledEvent, env: Env, ctx: ExecutionContext): Promise<void> {
-    if (!isWithinWorkingHours(new Date(), env.DEFAULT_TIMEZONE)) return;
+    const now = new Date();
+    if (!isWithinWorkingHours(now, env.DEFAULT_TIMEZONE)) return;
     ctx.waitUntil(
-      runCheck(env).catch(async (e) => {
-        const msg = `Unhandled error in scheduled check: ${(e as Error).stack ?? e}`;
-        console.log(msg);
-        await notifyError(env, "PokeHive watch: check crashed", msg);
-      }),
+      (async () => {
+        const today = dateStringInTimeZone(now, env.DEFAULT_TIMEZONE);
+        const stored = await env.SNAPSHOTS.get<StoredState>("state", "json");
+        if (stored?.lastChangeDate === today) {
+          console.log(`Skipping check: a change was already found and notified today (${today}).`);
+          return;
+        }
+        await runCheck(env).catch(async (e) => {
+          const msg = `Unhandled error in scheduled check: ${(e as Error).stack ?? e}`;
+          console.log(msg);
+          await notifyError(env, "PokeHive watch: check crashed", msg);
+        });
+      })(),
     );
   },
 

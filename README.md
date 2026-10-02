@@ -5,7 +5,8 @@ Cloudflare Worker that checks
 member-only wholesale list every hour, 10am-8pm Eastern on weekdays, and
 pushes a [Pushover](https://pushover.net) notification when a product is added,
 removed, or has a price change — across the main wholesale list and the
-Pre-Orders section.
+Pre-Orders section. Once a change is found and successfully notified, the
+rest of that day's checks are skipped (hourly checks resume the next day).
 
 ## Why this one looks different from `wholesale-pokemon-watch`
 
