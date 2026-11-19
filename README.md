@@ -120,6 +120,7 @@ runs when a tracked image's filename actually changes.
 ```
 npm install
 npm run dev      # local dev server (uses real Browser Rendering + a real login)
+npm run build    # bundle without deploying (wrangler deploy --dry-run); the verification gate
 npm run deploy   # deploy to Cloudflare
 npm run tail     # stream logs from the deployed worker
 ```
