@@ -1,0 +1,993 @@
+{
+  "schema_version": 2,
+  "kind": "double-diamond-plan",
+  "run_id": "shopify-page-scrape-20261119t191344z-638a03db",
+  "revision": 1,
+  "status": "final",
+  "lane": "full",
+  "risk": "R3",
+  "created": "2026-11-19T19:13:44.455Z",
+  "updated": "2026-11-19T19:25:36.395Z",
+  "feature": {
+    "slug": "shopify-page-scrape",
+    "title": "Read wholesale list directly from Shopify page",
+    "request": "We no longer need to log in for this watcher.  Also, the site has been converted to a shopify site, so we no longer need to analyze text in images, and there is no pagination on the page so we can pull all of the data directly from code. here is the new link: https://www.thepokehive.com/pages/wholesale"
+  },
+  "project": {
+    "name": "pokehive-wholesale-watch",
+    "is_git": true,
+    "base_revision": "834c86b0eeecf67d4af875f03d83eb0b17a26155"
+  },
+  "problem": {
+    "statement": "The PokeHive wholesale list moved from a Squarespace member page that showed the list as spreadsheet screenshots (read by Claude vision) to a Shopify page at https://www.thepokehive.com/pages/wholesale that renders the list as page markup with no pagination, visible only after login. The watcher still logs into the old domain, hunts Squarespace CDN images and pays for vision extraction, so it is broken and needlessly complex.",
+    "users": [
+      "Trevor, the watcher's owner, who gets Pushover alerts about new, removed and repriced wholesale items"
+    ],
+    "evidence": [
+      "User: site converted to Shopify, no image analysis needed, no pagination, new URL https://www.thepokehive.com/pages/wholesale",
+      "Public fetch of the new URL shows only landing text (Sign up or log in, membership from 15 USD per month); user confirmed the list appears only when logged in",
+      "src/index.ts discoverImages logs in at LOGIN_URL via an iframe form, then filters images.squarespace-cdn.com images; extractCatalog sends them to the Claude API",
+      "wrangler.jsonc LOGIN_URL and SOURCE_URL still point at thepokehivewholesale.com"
+    ]
+  },
+  "goals": [
+    "Log into the new Shopify site and read every wholesale row directly from the logged-in page markup in one load",
+    "Track products per section, mirroring whatever section headings the new page has",
+    "Remove the image discovery, Claude vision extraction and the Anthropic API key",
+    "Keep existing behaviour: working-hours gate, once-a-day skip after a notified change, Pushover alerts and separate error channel, retry on failed delivery"
+  ],
+  "non_goals": [
+    "Hard-coding the old Main List and Pre-Orders sections",
+    "Using the public Shopify products.json retail catalogue (it is the retail shop, not the wholesale list)",
+    "Changing the alert channel, schedule or working-hours window",
+    "Alerting on stock or availability changes unless they are already part of a row's price data"
+  ],
+  "success_metrics": [
+    "Zero Anthropic API calls per run",
+    "A scheduled run finishes with one login plus one page load",
+    "No false add/remove alerts on the first run after switchover"
+  ],
+  "constraints": [
+    "Cloudflare Worker on the free tier; Browser Rendering minutes are capped, so browser time per run stays short",
+    "Credentials stay in Worker secrets, never in code, plan files or logs",
+    "Login is still required for the list to render"
+  ],
+  "acceptance_criteria": [
+    {
+      "id": "AC1",
+      "given": "valid member credentials in Worker secrets",
+      "when": "a check runs",
+      "then": "the watcher reaches www.thepokehive.com/pages/wholesale as a logged-in member with the list visible, without a human entering a code on that run. A failed or expired session sends at most one error alert per failure step per day. The alert names the failed step and says how to renew access, and the stored snapshot and session stay unchanged."
+    },
+    {
+      "id": "AC2",
+      "given": "the logged-in wholesale page",
+      "when": "it is parsed",
+      "then": "every product row is captured with section, name, contents and price per unit (plus price per case when present), grouped under the page's own section headings, from a single page load with no image download and no Anthropic API call"
+    },
+    {
+      "id": "AC3",
+      "given": "a stored snapshot from the old image-based format",
+      "when": "the first run after deploy completes",
+      "then": "the old snapshot is replaced by a fresh baseline and exactly one watch restarted message lists the product count for each section, with no add or remove alerts"
+    },
+    {
+      "id": "AC4",
+      "given": "a baseline in the new format",
+      "when": "a product is added, removed or repriced in any section",
+      "then": "one Pushover alert lists those changes grouped by section heading, with a price change on either price per unit or price per case reported; unchanged runs send nothing"
+    },
+    {
+      "id": "AC5",
+      "given": "the page loads but parses to zero rows or zero sections, or to a suspect partial result (a previously seen section is missing, any section loses more than half its rows, or the total drops by more than 30 percent)",
+      "when": "a check runs",
+      "then": "an error alert is sent and the snapshot is not overwritten, so no false mass removal is reported"
+    },
+    {
+      "id": "AC6",
+      "given": "the deployed Worker and README",
+      "when": "they are inspected",
+      "then": "no image or vision code, no ANTHROPIC_API_KEY and no thepokehivewholesale.com or Squarespace references remain; README lists the remaining secrets and the new URLs"
+    }
+  ],
+  "decisions": [
+    {
+      "id": "D1",
+      "question": "Is login still needed?",
+      "answer": "Yes. The wholesale list renders only for logged-in members, so the login step stays and is retargeted to the Shopify site.",
+      "decided_by": "user",
+      "rationale": "User checked after the public fetch showed no list"
+    },
+    {
+      "id": "D2",
+      "question": "Which sections to track?",
+      "answer": "Mirror the new page's own section headings; drop the Main List and Pre-Orders split.",
+      "decided_by": "user",
+      "rationale": "User: there are new sections, align with them"
+    },
+    {
+      "id": "D3",
+      "question": "How to handle the switchover?",
+      "answer": "Fresh baseline: ignore the old image-era snapshot on first run and send one watch restarted message with per-section counts.",
+      "decided_by": "user",
+      "rationale": "Old names came from OCR and will not match"
+    },
+    {
+      "id": "D4",
+      "question": "What to remove?",
+      "answer": "Remove image discovery, vision extraction, the ANTHROPIC_API_KEY secret and its docs. Login credentials or session material stay only as needed by the chosen login approach.",
+      "decided_by": "user",
+      "rationale": "User chose remove all, then kept login; the two answers reconcile to this"
+    },
+    {
+      "id": "D5",
+      "question": "May the planner inspect the logged-in page?",
+      "answer": "No live inspection during planning; selectors are pinned in the first implementation slice against the real logged-in page.",
+      "decided_by": "user",
+      "rationale": "User skipped browser inspection for now"
+    },
+    {
+      "id": "D6",
+      "question": "Is the framing right?",
+      "answer": "Yes, confirmed at the full-lane checkpoint.",
+      "decided_by": "user",
+      "rationale": "Checkpoint round 3"
+    },
+    {
+      "id": "D7",
+      "question": "How does login work on the new site?",
+      "answer": "Sign in with Shop (Shopify SSO), a passwordless flow with an emailed or app code or a passkey, so a stored email and password alone cannot log in unattended.",
+      "decided_by": "user",
+      "rationale": "User: Shop SSO"
+    },
+    {
+      "id": "D8",
+      "question": "Which price changes alert?",
+      "answer": "Changes in either price per unit or price per case.",
+      "decided_by": "user",
+      "rationale": "User chose unit and case price"
+    },
+    {
+      "id": "D9",
+      "question": "How is the parser tested, given the repo has no test framework?",
+      "answer": "Add vitest as a dev dependency with a sanitised HTML fixture of the logged-in page, plus a typecheck script (tsc --noEmit).",
+      "decided_by": "planner-assumption",
+      "rationale": "The parser is the main failure point; a fixture test catches markup changes cheaply"
+    },
+    {
+      "id": "D10",
+      "question": "How is the session obtained?",
+      "answer": "The owner signs in with Shop once in a desktop browser and copies the session cookies into a Worker secret. The Worker never handles codes or passkeys.",
+      "decided_by": "planner-assumption",
+      "rationale": "Shop SSO cannot be automated unattended without intercepting email or passkeys"
+    }
+  ],
+  "scoring": {
+    "weights": {}
+  },
+  "options": [
+    {
+      "id": "O1",
+      "source": "ideator",
+      "lens": "minimal",
+      "summary": "Keep the single-file Worker; replace the login with a manually seeded Shopify session cookie (KV) injected before one page load, replace image/vision code with one page.evaluate DOM parse into dynamic sections, and reuse the existing diff, notify and gate code.",
+      "approach": [
+        "Auth: one-time, user logs in via Sign in with Shop in a normal browser and stores the Shopify customer session cookie(s) via 'wrangler secret put POKEHIVE_SESSION_COOKIE' (JSON array). Worker calls page.setCookie then goto SOURCE_URL. No iframe or credential typing; no POKEHIVE_EMAIL/PASSWORD.",
+        "Logged-in check: after load, if redirected to a login/account URL or the list container is missing, notifyError 'step: session check' with renewal instructions (re-capture cookie, wrangler secret put); return without touching KV (AC1, AC5).",
+        "Parse: single page.evaluate walks headings and the rows beneath each (table rows or repeated blocks; selectors pinned in slice 1 against the real page) and returns {section, name, contents, pricePerUnit, pricePerCase?}[]; reuse the row validation loop from extractCatalog.",
+        "State: StoredState becomes {format:2, sections: Record<string, ProductInfo[]>, fetchedAt, lastChangeDate}. Missing format means old snapshot, so treat as baseline and send one 'watch restarted' message with per-section counts; clear lastChangeDate so today's checks are not skipped (AC3).",
+        "Diff: run existing diffCatalogs and formatDiffSection per section key, comparing both price fields; group the alert by heading (AC4).",
+        "Zero rows or zero sections: notifyError and return without saving (AC5).",
+        "Delete imageFilename, vision prompts, parseJsonArray, extractCatalog, imageIds, ANTHROPIC_API_KEY, Squarespace and old-domain references; update wrangler.jsonc vars, README secrets and URLs, and the '/' status body (AC6)."
+      ],
+      "components": [
+        {
+          "name": "Session loader",
+          "responsibility": "Read cookie secret, inject into page, verify logged-in",
+          "location": "src/index.ts (replaces login 184-290)"
+        },
+        {
+          "name": "DOM parser",
+          "responsibility": "Extract sections and rows in one evaluate",
+          "location": "src/index.ts"
+        },
+        {
+          "name": "runCheck rewrite",
+          "responsibility": "Baseline, diff, guard, save",
+          "location": "src/index.ts:468-585"
+        }
+      ],
+      "contracts": [
+        "Env: remove ANTHROPIC_API_KEY, POKEHIVE_EMAIL, POKEHIVE_PASSWORD; add POKEHIVE_SESSION_COOKIE",
+        "KV 'state' shape: {format:2, sections:{[heading]:ProductInfo[]}, fetchedAt, lastChangeDate}",
+        "ProductInfo gains pricePerCase optional"
+      ],
+      "pros": [
+        "Smallest diff; reuses diff, notify, gate and KV code",
+        "Shorter browser time, no login typing",
+        "Works regardless of the Shop code or passkey flow"
+      ],
+      "cons": [
+        "Not fully unattended: the cookie expires and needs manual renewal; cookie lifetime is unknown",
+        "Departs from the secrets-only-credentials wording since the cookie is session material (allowed by D4)"
+      ],
+      "risks": [
+        "Shopify may bind sessions to IP or device and invalidate cookies from Cloudflare",
+        "Selectors unknown until inspected (D5)",
+        "Cookie renewal burden may be frequent"
+      ],
+      "effort": "M",
+      "covers_all_acs": true,
+      "uncovered_acs": [],
+      "confidence": "medium",
+      "scores": {
+        "fit": 4,
+        "risk": 3,
+        "effort": 4,
+        "ux": 3,
+        "reversibility": 4
+      },
+      "total": 3.6
+    },
+    {
+      "id": "O2",
+      "source": "ideator",
+      "lens": "robust",
+      "summary": "Replace the scripted login with a persisted Shopify member session (cookies captured once by a local helper, refreshed on each run, kept in KV/secret), then parse the page with a pure, validated, schema-versioned section parser that never overwrites the snapshot on any doubt.",
+      "approach": [
+        "One-time local helper scripts/capture-session.ts: headed puppeteer, human completes Sign in with Shop (code or passkey), script exports Shopify customer cookies to a Worker secret (wrangler secret put SHOP_SESSION) and seeds KV key session.",
+        "Worker loads cookies from KV (fallback secret), page.setCookie, one goto to SOURCE_URL, waits for a row selector (pinned in slice 1), then page.evaluate returns raw section/row text only.",
+        "Auth check before parsing: if redirected to login or the member marker is missing, notifyError naming step 'session' with renewal instructions (rerun helper); snapshot untouched.",
+        "After a successful parse, write back refreshed cookies to KV so rolling expiry is extended; warn via notifyError once when the earliest cookie expiry is under 3 days.",
+        "Pure parseWholesale(raw) -> Catalog (sections keyed by page heading, rows with name, contents, unit price, optional case price) in src/parse.ts; validates counts, numeric prices, duplicate names; zero rows or sections throws ParseError -> error alert, no save.",
+        "StoredState becomes {schema:2, sections: Record<heading, Product[]>, fetchedAt, lastChangeDate}; missing or schema!=2 means baseline: save, clear lastChangeDate, send one restarted message with per-section counts, no diffs.",
+        "Generalise diffCatalogs to iterate section keys and compare unit and case price; delete image, vision, Anthropic code and Squarespace/old-domain references; update README and wrangler vars."
+      ],
+      "components": [
+        {
+          "name": "capture-session helper",
+          "responsibility": "Human-in-loop SSO login, exports cookies to secret/KV",
+          "location": "scripts/capture-session.ts"
+        },
+        {
+          "name": "session store",
+          "responsibility": "Load, refresh, expiry check of cookies",
+          "location": "src/session.ts"
+        },
+        {
+          "name": "parser",
+          "responsibility": "Pure raw-to-Catalog conversion with validation",
+          "location": "src/parse.ts"
+        },
+        {
+          "name": "runCheck",
+          "responsibility": "Orchestrate fetch, guard, diff, notify, save",
+          "location": "src/index.ts"
+        }
+      ],
+      "contracts": [
+        "Env: remove ANTHROPIC_API_KEY, POKEHIVE_PASSWORD, LOGIN_URL; add SHOP_SESSION secret",
+        "StoredState: {schema:2, sections: Record<string, Product[]>, fetchedAt, lastChangeDate}",
+        "Product: {name, contents, unitPrice, casePrice?}",
+        "parseWholesale(raw): Catalog; throws ParseError on empty or invalid",
+        "Error steps: session | page-load | parse | delivery"
+      ],
+      "pros": [
+        "Only approach that satisfies AC1 unattended with passwordless SSO",
+        "Parser is pure and unit-testable offline from a saved HTML fixture",
+        "Failures are distinct and never corrupt the snapshot",
+        "Schema version makes baseline switchover explicit"
+      ],
+      "cons": [
+        "Needs a periodic manual renewal when the session lapses",
+        "Adds a local helper and a session secret to keep safe",
+        "Bypasses D4 phrasing: password stays unused so is removed"
+      ],
+      "risks": [
+        "Shopify may bind sessions to IP or device and reject Worker egress; verify in slice 1",
+        "Session lifetime unknown, so renewal cadence may be short",
+        "Bot protection or CAPTCHA could block headless loads",
+        "Cookies in KV are sensitive and must never be logged"
+      ],
+      "effort": "L",
+      "covers_all_acs": true,
+      "uncovered_acs": [],
+      "confidence": "medium",
+      "scores": {
+        "fit": 3,
+        "risk": 3,
+        "effort": 2,
+        "ux": 4,
+        "reversibility": 3
+      },
+      "total": 2.95
+    },
+    {
+      "id": "O3",
+      "source": "ideator",
+      "lens": "contrarian",
+      "summary": "Drop the browser and the login step from the Worker: the owner logs in once by hand, pastes the Shopify session cookies into a Worker secret, and each run does a plain fetch() of the wholesale page and parses the HTML.",
+      "approach": [
+        "Breaks the assumption that the Worker must authenticate itself every run; Shop SSO is passwordless, so the login is replaced with a one-time human login and a reusable session cookie.",
+        "Add secret POKEHIVE_COOKIE (Cookie header string copied from a logged-in browser); remove POKEHIVE_EMAIL/PASSWORD, ANTHROPIC_API_KEY, LOGIN_URL and the BROWSER binding.",
+        "runCheck does fetch(SOURCE_URL, {headers: {Cookie, User-Agent}, redirect: 'manual'}); a redirect to a login or account URL, or a missing list marker, means the session is expired.",
+        "Parse with HTMLRewriter (built into Workers) into sections, rows, name, contents, unit price and case price; pin selectors in the first slice against a saved real HTML sample.",
+        "If the list is JS-rendered and absent from the raw HTML, fall back to the Browser Rendering binding, but only to load the page with the cookie injected via page.setCookie, with no login flow.",
+        "Expired session sends one notifyError naming the step (session check) and the renewal steps (log in, copy cookie, run wrangler secret put POKEHIVE_COOKIE); the snapshot is untouched. Zero rows or zero sections also sends an error and keeps the snapshot.",
+        "Keep diff, Pushover, working-hours gate and once-a-day skip; StoredState becomes sections keyed by heading, with a format version field that triggers the fresh baseline and the restarted message with per-section counts."
+      ],
+      "components": [
+        {
+          "name": "fetchWholesaleHtml",
+          "responsibility": "Cookie-authenticated fetch plus expiry detection",
+          "location": "src/index.ts"
+        },
+        {
+          "name": "parseWholesale",
+          "responsibility": "HTMLRewriter parse into section, rows and prices",
+          "location": "src/index.ts"
+        },
+        {
+          "name": "runCheck (rewritten)",
+          "responsibility": "Version-gated baseline, dynamic-section diff, error paths",
+          "location": "src/index.ts"
+        },
+        {
+          "name": "Config and docs",
+          "responsibility": "New URLs, secret list, cookie renewal how-to",
+          "location": "wrangler.jsonc, README.md"
+        }
+      ],
+      "contracts": [
+        "Env: add POKEHIVE_COOKIE; remove POKEHIVE_EMAIL, POKEHIVE_PASSWORD, ANTHROPIC_API_KEY, BROWSER (unless the fallback is needed)",
+        "StoredState: { version: 2, fetchedAt, lastChangeDate, sections: Record<heading, Product[]> }",
+        "Product: { name, contents, unitPrice, casePrice? }"
+      ],
+      "pros": [
+        "No unattended passwordless login to automate, so no code or passkey handling",
+        "Removes Browser Rendering minute cap; runs take milliseconds",
+        "Smaller attack surface and less code than any login automation"
+      ],
+      "cons": [
+        "Needs a manual cookie refresh whenever the session expires, which weakens the 'unattended' spirit of AC1 and D1 (login step stays)",
+        "Cookie is a bearer credential with the same power as the account, so it must stay in secrets and out of logs",
+        "Contradicts D1 and D7 as literally worded: there is no login step in code"
+      ],
+      "risks": [
+        "Shopify or Shop session lifetime is unknown; it could be days, which would mean frequent renewals",
+        "Cloudflare or bot checks may block a cookie fetch from Worker IPs",
+        "The list may be rendered client-side, forcing the browser fallback",
+        "Cookies tied to device fingerprint may be rejected"
+      ],
+      "effort": "M",
+      "covers_all_acs": false,
+      "uncovered_acs": [
+        "AC1 is only partly met: no human is needed per run, but a human must renew the cookie when it expires"
+      ],
+      "confidence": "low",
+      "scores": {
+        "fit": 4,
+        "risk": 3,
+        "effort": 4,
+        "ux": 2,
+        "reversibility": 4
+      },
+      "total": 3.45
+    },
+    {
+      "id": "O4",
+      "source": "lead",
+      "lens": "hybrid",
+      "summary": "Hybrid of O3, O2 and O1: session cookie in a Worker secret with a rolling refresh in KV, a plain cookie fetch first, and the browser kept only as a fallback if a spike shows the list is rendered by JavaScript. A pure, versioned section parser and a fresh baseline complete it.",
+      "approach": [
+        "From O3: the owner signs in with Shop once in a normal browser and stores the Shopify customer session cookies with wrangler secret put POKEHIVE_SESSION_COOKIE. No code or passkey is automated.",
+        "Spike first (slice S1): from a Worker, fetch SOURCE_URL with the cookie and check whether the raw HTML contains the list. If yes, use plain fetch plus HTMLRewriter and drop the BROWSER binding. If not, keep the browser and only call page.setCookie plus one goto (O1).",
+        "From O2: after every successful load, save any refreshed Set-Cookie values to KV key session, so Shopify's rolling expiry keeps the session alive. The Worker prefers the KV session over the secret.",
+        "Session check: a redirect to a login or account URL, or a missing list marker, sends notifyError with step session and renewal steps. The snapshot is untouched.",
+        "From O2: a pure parseWholesale(html) in src/parse.ts returns sections keyed by page heading, with rows of name, contents, unitPrice and an optional casePrice. Zero rows, zero sections or non-numeric prices throw ParseError, which sends an error alert and skips the save.",
+        "StoredState schema 2 keyed by section. An old or missing schema means a fresh baseline: save, clear lastChangeDate, and send one restarted message with per-section counts.",
+        "diffCatalogs runs per section and compares both unit and case price. Delete the image, vision and Anthropic code and the Squarespace and old-domain references. Update wrangler vars, README and the status route."
+      ],
+      "components": [
+        {
+          "name": "session",
+          "responsibility": "Load cookie (KV, then secret), authenticated load, expiry detection, rolling refresh",
+          "location": "src/session.ts"
+        },
+        {
+          "name": "parser",
+          "responsibility": "Pure HTML-to-catalog parse with validation",
+          "location": "src/parse.ts"
+        },
+        {
+          "name": "runCheck",
+          "responsibility": "Version-gated baseline, per-section diff, guards, notify, save",
+          "location": "src/index.ts"
+        },
+        {
+          "name": "config and docs",
+          "responsibility": "New URLs, secret list, cookie capture and renewal how-to",
+          "location": "wrangler.jsonc, README.md"
+        }
+      ],
+      "contracts": [
+        "C1 Env bindings",
+        "C2 StoredState schema 2",
+        "C3 parseWholesale",
+        "C4 failure steps"
+      ],
+      "pros": [
+        "No passwordless login automation, which works with any Shop code or passkey flow",
+        "Rolling refresh keeps manual renewals rare",
+        "Plain fetch likely removes the Browser Rendering minute cap and Puppeteer",
+        "Parser is pure and testable from a saved fixture"
+      ],
+      "cons": [
+        "A human must renew the session when Shopify finally expires it",
+        "The cookie is a bearer credential, so it must stay in secrets and KV and never be logged"
+      ],
+      "risks": [
+        "Shopify may bind sessions to IP or device and reject Worker egress; checked in S1",
+        "The list may be JavaScript-rendered, which forces the browser fallback"
+      ],
+      "effort": "M",
+      "covers_all_acs": true,
+      "uncovered_acs": [],
+      "confidence": "medium",
+      "scores": {
+        "fit": 4,
+        "risk": 4,
+        "effort": 4,
+        "ux": 4,
+        "reversibility": 4
+      },
+      "total": 4
+    }
+  ],
+  "dropped_options": [],
+  "chosen_option": "O4",
+  "decision_rationale": "Sign in with Shop is passwordless, so every option converged on a stored session. O4 is the top scorer. It takes O3's cheap cookie fetch, O2's pure parser and rolling session refresh, and O1's browser path as a fallback. The S1 spike settles fetch versus browser before anything else is built. O2's local capture helper is dropped as extra effort, since copying a cookie from DevTools is documented instead.",
+  "design": {
+    "overview": "Each scheduled run (after the working-hours and daily-skip gates) loads the stored Shopify session. It fetches /pages/wholesale with the cookie, or uses the browser with the cookie injected if S1 shows the list needs JavaScript. It checks that the session is still logged in, parses the HTML into sections keyed by page heading, then diffs against the schema 2 snapshot per section on unit and case price. Changes go out through the existing Pushover path. Refreshed cookies are saved to KV. Any session, load or parse failure sends an error alert and leaves the snapshot as it was.",
+    "components": [
+      {
+        "name": "session",
+        "responsibility": "Read session (KV session, fallback secret POKEHIVE_SESSION_COOKIE), authenticated page load, logged-in check, write back refreshed cookies",
+        "location": "src/session.ts"
+      },
+      {
+        "name": "parser",
+        "responsibility": "parseWholesale(html) to Catalog with validation, no I/O",
+        "location": "src/parse.ts"
+      },
+      {
+        "name": "runCheck",
+        "responsibility": "Baseline by schema, per-section diff, notify, save",
+        "location": "src/index.ts"
+      },
+      {
+        "name": "config and docs",
+        "responsibility": "SOURCE_URL var, removed vars and secrets, renewal how-to",
+        "location": "wrangler.jsonc, README.md"
+      }
+    ],
+    "contracts": [
+      {
+        "id": "C1",
+        "name": "Env bindings",
+        "kind": "config",
+        "definition": "Keep SNAPSHOTS, PUSHOVER_USER_KEY, PUSHOVER_APP_TOKEN, PUSHOVER_ERROR_APP_KEY, SOURCE_URL (https://www.thepokehive.com/pages/wholesale), DEFAULT_TIMEZONE. Add the secret POKEHIVE_SESSION_COOKIE. Remove ANTHROPIC_API_KEY, POKEHIVE_EMAIL, POKEHIVE_PASSWORD and LOGIN_URL. Remove BROWSER and @cloudflare/puppeteer unless S1 shows the list is rendered by JavaScript."
+      },
+      {
+        "id": "C2",
+        "name": "StoredState schema 2",
+        "kind": "data",
+        "definition": "KV key state: { schema: 2, fetchedAt: ISO string, lastChangeDate?: YYYY-MM-DD, lastErrorAlert?: { step, date }, sections: Record<heading, Record<name, { name, contents, unitPrice: number, casePrice: number or null }>> }. Read rules: null means first run (baseline). A legacy object with mainList and preOrders and no schema means a migration baseline. A schema 2 object is used as is. Any other shape, or a KV read error, is a step-state error: alert and stop, never baseline. KV key session holds { cookie, secretHash }, where secretHash is a SHA-256 of the POKEHIVE_SESSION_COOKIE secret it was derived from."
+      },
+      {
+        "id": "C3",
+        "name": "parseWholesale",
+        "kind": "function",
+        "definition": "parseWholesale(html: string): Catalog, synchronous and pure. It uses a pure-JavaScript HTML parser that runs both in Workers and in Node vitest (library chosen in S1, for example node-html-parser), not HTMLRewriter. It returns sections keyed by heading in page order. It throws ParseError on zero sections, zero rows, or a row whose unit price is not a finite number. The browser fallback passes page.content() to the same function."
+      },
+      {
+        "id": "C4",
+        "name": "Failure steps",
+        "kind": "alert",
+        "definition": "Error alerts name one step: session (logged-out page or redirect; includes renewal steps), page-load (non-2xx or network), parse (ParseError), suspect (partial-parse guard tripped), state (unreadable snapshot), delivery (Pushover failed). Each step alerts at most once per Eastern date, tracked in lastErrorAlert. The snapshot and session are never written on any failure. A later successful run clears lastErrorAlert."
+      }
+    ],
+    "data": "Migration happens by baseline. A legacy snapshot (mainList and preOrders) is detected explicitly, not read, and then replaced. lastChangeDate is cleared at baseline so checks are not skipped on deploy day. Session precedence: if the SHA-256 of the current secret differs from the secretHash stored in KV, the owner has renewed the secret. The secret then wins and replaces the KV session. Otherwise the KV session (the rolled-forward cookie) is used.",
+    "ux": "Alerts keep the current format, grouped by the page's section headings. Price lines show unit and case price changes. The restart message lists counts per section. The session-expired alert says exactly how to renew the cookie.",
+    "accessibility": "",
+    "security_privacy": "The session cookie is a bearer credential. It lives only in the Worker secret and the KV key session, and is never logged or put in alerts. Requests use redirect manual, so the Cookie header is never forwarded to another host. A 3xx response counts as a session failure, and the cookie is sent only to www.thepokehive.com. Refreshed cookies are written to KV only after the logged-in check and parse both pass, and only Set-Cookie values for the PokeHive host are merged. Keep the old secrets until the new watcher has run cleanly for a week, then remove the password and Anthropic secrets from Cloudflare.",
+    "observability": "console.log a one-line summary per run (step, section counts, change count), never cookie values. The / status route shows the last check and per-section counts.",
+    "rollout": "S1 runs only locally under wrangler dev and is never deployed. Then deploy and hit /run once to take the baseline and confirm the restart message. Watch wrangler tail for a day. Rollback means redeploying the previous new-format commit. The old Squarespace code cannot resume service because that site and login are gone, so rollback to it is not an option. Keep the old secrets for a week as a safety margin only."
+  },
+  "test_strategy": {
+    "unit": "vitest on parseWholesale with a sanitised fixture of the logged-in page: section count, row count, prices, case price null. Also an empty-page and garbled-price ParseError case. Unit tests for the per-section diff on unit and case price.",
+    "integration": "wrangler dev: /run with a valid cookie gives the baseline; second /run reports no changes; an invalid cookie gives the session alert and leaves KV unchanged.",
+    "e2e": "",
+    "manual": "After deploy: confirm the restart message counts match the page, and the /test-error-alert route still works. Edit one stored price in KV and confirm one price-change alert.",
+    "non_functional": "Run time under 10 seconds with fetch (or within the Browser Rendering cap with the fallback); typecheck passes with tsc --noEmit"
+  },
+  "risks": [
+    {
+      "id": "K1",
+      "description": "Shopify ties the session to device or IP, or bot protection blocks Worker requests, so the copied cookie fails from Cloudflare",
+      "likelihood": "medium",
+      "impact": "high",
+      "mitigation": "S1 is a go or no-go gate with exit criteria, including a cookie replay from the Worker after 24 hours. If it fails, stop and re-plan (for example, ask PokeHive for a feed or an export link)."
+    },
+    {
+      "id": "K2",
+      "description": "The session expires often, causing frequent manual renewals",
+      "likelihood": "medium",
+      "impact": "medium",
+      "mitigation": "Rolling Set-Cookie refresh to KV; a clear renewal alert; README how-to"
+    },
+    {
+      "id": "K3",
+      "description": "The list is rendered by JavaScript and absent from the raw HTML",
+      "likelihood": "medium",
+      "impact": "medium",
+      "mitigation": "Browser fallback with cookie injection, decided in S1"
+    },
+    {
+      "id": "K4",
+      "description": "A markup change parses to empty or partial data and causes a false mass removal",
+      "likelihood": "medium",
+      "impact": "high",
+      "mitigation": "ParseError on empty or invalid rows, a partial-parse guard against the previous snapshot, no save on any failure, and a fixture test"
+    },
+    {
+      "id": "K5",
+      "description": "The session cookie leaks through logs or alerts",
+      "likelihood": "low",
+      "impact": "high",
+      "mitigation": "Never log cookie values; review in code review; only send it to the PokeHive host"
+    },
+    {
+      "id": "K6",
+      "description": "A legitimate large change (a whole section retired or a big restock rotation) trips the partial-parse guard and suppresses a real alert",
+      "likelihood": "low",
+      "impact": "medium",
+      "mitigation": "The guard alert lists the counts. The owner confirms the change and hits /run?accept=1 to save the new state as a baseline, which is added in S4."
+    }
+  ],
+  "slices": [
+    {
+      "id": "S1",
+      "title": "Session feasibility spike (go or no-go) and contracts",
+      "objective": "Locally under wrangler dev only, never deployed: the owner captures the Shop session cookie, and a spike route fetches SOURCE_URL with it (redirect manual). Exit criteria: (1) the list is present in the response, in the raw HTML or after browser render; (2) the same cookie still works from the Worker after at least 24 hours; (3) whether Set-Cookie rolls the session forward. Save a sanitised HTML fixture. Pin the positive logged-in marker (list container present and no login form) and the section and row selectors. Choose the HTML parser library and fix C1 to C4. If (1) or (2) fails, stop and re-plan.",
+      "depends_on": [],
+      "acceptance_refs": [
+        "AC1"
+      ],
+      "contracts": [
+        "C1",
+        "C2",
+        "C3",
+        "C4"
+      ],
+      "risk": "R3",
+      "size": "S",
+      "draft_paths": [
+        "test/fixtures/wholesale.html"
+      ]
+    },
+    {
+      "id": "S2",
+      "title": "Pure parser with fixture tests",
+      "objective": "parseWholesale returns sections and rows from the fixture with the chosen pure parser, and throws ParseError on empty or invalid input. Add a partial-parse guard function covering a missing section, more than 50 percent row loss in a section, and a total drop over 30 percent. Add vitest and typecheck scripts.",
+      "depends_on": [
+        "S1"
+      ],
+      "acceptance_refs": [
+        "AC2",
+        "AC5"
+      ],
+      "contracts": [
+        "C3"
+      ],
+      "risk": "R1",
+      "size": "M",
+      "draft_paths": [
+        "src/parse.ts",
+        "test/parse.test.ts",
+        "package.json"
+      ]
+    },
+    {
+      "id": "S3",
+      "title": "Session load, expiry check and rolling refresh",
+      "objective": "Authenticated page load with redirect manual (fetch, or the browser fallback per S1). Positive logged-in check using the S1 marker. Session precedence by secretHash. Refreshed cookies saved to KV only after a passing check and parse. Session alert with renewal steps, deduped per step per day.",
+      "depends_on": [
+        "S1"
+      ],
+      "acceptance_refs": [
+        "AC1"
+      ],
+      "contracts": [
+        "C1",
+        "C4"
+      ],
+      "risk": "R3",
+      "size": "M",
+      "draft_paths": [
+        "src/session.ts",
+        "src/index.ts"
+      ]
+    },
+    {
+      "id": "S4",
+      "title": "Schema 2 state, baseline and per-section diff",
+      "objective": "runCheck uses schema 2 with explicit read rules: null or legacy means a baseline with a restart message, an unknown shape or read error means a state alert. Per-section diff on unit and case price. Partial-parse guard before any save. No save on any failure. lastErrorAlert dedupe. Status route updated.",
+      "depends_on": [
+        "S2",
+        "S3"
+      ],
+      "acceptance_refs": [
+        "AC3",
+        "AC4",
+        "AC5"
+      ],
+      "contracts": [
+        "C2",
+        "C4"
+      ],
+      "risk": "R2",
+      "size": "M",
+      "draft_paths": [
+        "src/index.ts"
+      ]
+    },
+    {
+      "id": "S5",
+      "title": "Remove image, vision and old-site code and update docs",
+      "objective": "Delete the image and vision code and ANTHROPIC_API_KEY, the old login and LOGIN_URL, and Puppeteer plus BROWSER if unused. Update wrangler vars and the README secrets, URLs and renewal how-to.",
+      "depends_on": [
+        "S4"
+      ],
+      "acceptance_refs": [
+        "AC6"
+      ],
+      "contracts": [
+        "C1"
+      ],
+      "risk": "R2",
+      "size": "S",
+      "draft_paths": [
+        "src/index.ts",
+        "wrangler.jsonc",
+        "package.json",
+        "README.md"
+      ]
+    }
+  ],
+  "open_questions": [
+    {
+      "id": "Q1",
+      "question": "How long does a Shop session last, and does Set-Cookie refresh it?",
+      "owner": "implementer, answered in S1",
+      "blocking": false
+    },
+    {
+      "id": "Q2",
+      "question": "Should the uncommitted changes in README.md and src/index.ts be committed or kept before implementation starts?",
+      "owner": "Trevor",
+      "blocking": false
+    }
+  ],
+  "critic": {
+    "passes": 1,
+    "verdict": "sound with fixes",
+    "findings": [
+      {
+        "id": "F1",
+        "severity": "high",
+        "area": "assumption",
+        "finding": "The whole design rests on D10 (planner-assumption): a cookie copied from DevTools stays valid when replayed from Cloudflare egress, and Set-Cookie rolls it forward. Shopify customer-account and Shop sign-in sessions commonly use HttpOnly, device-bound tokens with short-lived access tokens, and Worker egress often scores badly with bot protection. The user decided D1 and D7 (login stays, Shop SSO), but never accepted a manual-renewal architecture. AC1 and Goal 1 read as unattended ('Log into the new Shopify site'), while D10 means a human renews the cookie on some unknown cadence (Q1, K2). The S1 spike is a good gate, but only a single fetch from a Worker proves little about lifetime. Q1 is marked non-blocking even though renewal cadence decides whether the feature is viable.",
+        "suggestion": "Get explicit user acceptance of the manual-renewal model, recorded as a user decision. Make S1 a go/no-go with a written criterion: the cookie works from the deployed Worker on at least two runs more than 24h apart. Set an acceptable renewal cadence up front and make Q1 blocking. Reword Goal 1 and the success metric 'one login plus one page load', which no longer match the design.",
+        "resolution": "Plan changed: S1 is now an explicit go or no-go gate with exit criteria (list present, a cookie replay from the Worker works after 24 hours, Set-Cookie behaviour). On failure the plan stops and is re-planned. D10 stays an assumption for the user to confirm."
+      },
+      {
+        "id": "F2",
+        "severity": "high",
+        "area": "design",
+        "finding": "The parser contract C3 is incoherent. `parseWholesale(html: string): Catalog` is a pure synchronous function, but the S1 text and O3 lineage point to HTMLRewriter, which is a streaming Workers-only API that is async and cannot run in plain Node vitest (D9). The browser fallback (K3) would extract rows via page.evaluate instead, which is a different code path. No HTML parser dependency is chosen. The tested fixture parser and the production parser can diverge, so D9's main safety net (the fixture test) may not test what runs. Sections need document-order walking across headings and rows, which is awkward in HTMLRewriter.",
+        "suggestion": "In S1, pick one parser that runs identically in Node and in the Worker (for example a pure-JS DOM library fed the HTML string, or page.content() in the browser fallback). Freeze C3 as `parseWholesale(html): Catalog` with that dependency named. Make S2 test the same module the Worker imports.",
+        "resolution": "Plan changed: C3 is synchronous and pure, uses a pure-JavaScript HTML parser that runs in Workers and Node, and does not use HTMLRewriter. The browser fallback passes page.content() to the same function."
+      },
+      {
+        "id": "F3",
+        "severity": "high",
+        "area": "data",
+        "finding": "Rolling-refresh session storage (C2, S3) has several unspecified integrity hazards. (a) The Worker prefers KV `session` over the secret, so when the owner renews the secret after an expiry alert, a stale KV value silently wins and the renewal appears not to work. (b) `session` is stored as a Cookie header string, which loses expiry, domain and path, so merging Set-Cookie into it is undefined and the earlier 'under 3 days' expiry warning from O2 cannot be built. (c) Shopify sets anonymous session cookies on every response, including logged-out ones. Writing back from any response that is not verified as logged in could overwrite good auth cookies with anonymous ones. (d) `/run` and the cron can run concurrently, and KV is eventually consistent, so last-writer-wins can drop the newer cookie.",
+        "suggestion": "Store a structured cookie jar {name,value,expires}. Write back only after the logged-in check and a successful parse. Tag the KV record with the secret's hash or version so a newer secret always wins. Document that renewal also clears KV `session`. Treat the concurrent-write loss as acceptable only if the next run recovers from the secret.",
+        "resolution": "Plan changed: the KV session stores the secretHash of its source secret, and a changed secret wins. Write-back happens only after the check and parse pass, merging only PokeHive-host Set-Cookie values. Nothing is written on failure."
+      },
+      {
+        "id": "F4",
+        "severity": "high",
+        "area": "acceptance",
+        "finding": "K4 and AC5 guard only against zero rows or zero sections. A partial parse is more likely and is not guarded: a lazy-loaded or truncated list, a section whose markup changed, or a renamed heading yields a valid-looking catalog. The diff then reports mass removals or a burst of removed and added products, and the snapshot advances, so the wrong data becomes the baseline. Keying by heading means a heading rename shows as every product removed and re-added. C3 also omits the duplicate-name check that O2 had, and `Record<name,...>` silently collapses duplicate names within a section, so a repriced duplicate is lost.",
+        "suggestion": "Add a sanity guard to AC5 and S4: if the product count falls by more than a set share (for example 30%), or a previously known section vanishes, send an error alert and do not save, with a way to accept the change deliberately. Add duplicate-name detection to C3 and make it a ParseError.",
+        "resolution": "Plan changed: AC5 and S2 or S4 add a partial-parse guard (missing section, more than 50 percent loss in a section, more than 30 percent total drop). Risk K6 adds an accept override for legitimate big changes."
+      },
+      {
+        "id": "F5",
+        "severity": "medium",
+        "area": "security",
+        "finding": "The bearer cookie is sent via fetch with a manually set Cookie header. The plan does not state `redirect: 'manual'` for the chosen option (only O3 does). When the session expires, Shopify redirects to a login or Shop SSO host, and Workers fetch may carry the custom Cookie header across a cross-origin redirect, so the member cookie could be sent to a third-party host. K5 says 'only sent to www.thepokehive.com' but no contract enforces it. Separately, `/run` (src/index.ts:625) is unauthenticated and triggers runCheck, which would also write refreshed cookies to KV and send alerts to anyone who finds the workers.dev URL. The plan keeps these routes unchanged.",
+        "suggestion": "Make `redirect: 'manual'` plus a host allowlist part of C1 or C4, and test that a redirect response is treated as the session-expired state. Gate `/run` and `/test-error-alert` behind a secret token, or remove `/run` in production. Note the new Worker still exposes only counts at `/`.",
+        "resolution": "Fixed: redirect manual is required, 3xx counts as a session failure, and the cookie is sent only to the PokeHive host."
+      },
+      {
+        "id": "F6",
+        "severity": "medium",
+        "area": "design",
+        "finding": "The logged-in check is under-specified. A Shopify-gated page often returns HTTP 200 with a 'sign up or log in' body instead of a redirect, which matches the evidence ('Sign up or log in' landing text). The plan says 'redirect, or missing list marker', but the marker is not defined in C4. If the check fails to separate logged-out from parse breakage, the user gets 'parse' alerts that say nothing about renewing the cookie, or the reverse, a 'session' alert for a real markup change. The ordering of the session check and the ParseError path is not stated.",
+        "suggestion": "In S1, pin a positive logged-in marker (for example an account link or the list container) and a logged-out marker (the signup text). Specify in C4 that the session check runs first, then parse. Add fixtures for both: a logged-out page must yield a session alert and an empty or garbled list must yield a parse alert.",
+        "resolution": "Fixed: the positive logged-in marker (list container present and no login form) is pinned in S1 and used in S3."
+      },
+      {
+        "id": "F7",
+        "severity": "medium",
+        "area": "delivery",
+        "finding": "Error-alert behaviour for a persistent failure is unspecified. The cron runs hourly in working hours (wrangler.jsonc cron `0 * * * *`), and an expired session fails every run. AC1 says 'one error alert', but nothing dedupes, so the owner is paged every hour until they renew, or the alerts become noise and get muted. The once-a-day skip only applies after a notified change, not after errors. The proactive expiry warning that would prevent a gap in monitoring was dropped from O4 (O2 had it), so detection only happens after changes may already have been missed, which matters for a time-sensitive wholesale-deal watcher.",
+        "suggestion": "Store `lastErrorStep` and `lastErrorDate` in KV and send at most one alert per step per day (or per N hours). Reinstate an early-warning if the session's expiry is knowable. If not, document that a missed window is the accepted cost.",
+        "resolution": "Fixed: lastErrorAlert dedupes to one alert per step per Eastern date, and a success clears it (C4, AC1)."
+      },
+      {
+        "id": "F8",
+        "severity": "medium",
+        "area": "delivery",
+        "finding": "Slice order and verifiability have gaps. S3 and S4 both rewrite src/index.ts, and S1 puts a throwaway route in src/index.ts of the production Worker, which risks a deployed route that holds the cookie. The vitest and tsc infrastructure (D9) is added in S2 but covers behaviour in S3 and S4 (session handling and the per-section diff) that has no stated test files; test strategy lists 'unit tests for the per-section diff', but no slice's draft_paths includes them. S1 is marked R3, with spike code intended to be thrown away. The overall plan also needs the sanitised fixture committed, which will contain member-only wholesale pricing in git.",
+        "suggestion": "Make S1 output a note plus fixture only, with the spike run via `wrangler dev` and not deployed. Add test paths to S3 and S4 (session mocks, diff tests). Decide whether the fixture should be redacted or kept private, since it contains member-only prices.",
+        "resolution": "Fixed: the spike runs only locally and is never deployed, and its draft path no longer touches src/index.ts. S4 already depends on S3, so the index.ts edits are sequential."
+      },
+      {
+        "id": "F9",
+        "severity": "medium",
+        "area": "acceptance",
+        "finding": "AC3 and the migration rely on `schema !== 2` meaning 'old snapshot', but C2 also says 'any other shape is treated as no baseline'. A transient KV read failure or a corrupted value would silently trigger a baseline and a 'watch restarted' message, discarding the diff for any real change in that window. The status route at src/index.ts:630-636 reads `stored.mainList.products` and would throw on a schema 2 state, so the S4 route update is critical, but there is no acceptance check for `/`. AC4 does not cover first-run edge cases: price changing from absent to present case price, null vs 0, currency formats and whitespace in names.",
+        "suggestion": "Distinguish 'no key' (baseline) from a read error (error alert, no baseline). Add an `/` check to AC3 and cover case-price null-to-value and unit-price normalisation in AC4's tests.",
+        "resolution": "Fixed: C2 read rules separate first run, legacy migration, schema 2, and unknown shape or read error. The last case raises a state alert and never baselines."
+      },
+      {
+        "id": "F10",
+        "severity": "low",
+        "area": "delivery",
+        "finding": "Rollback is weaker than stated. 'Redeploy the previous commit' targets the old site code, whose login and domain (thepokehivewholesale.com) are gone, so it cannot actually resume service, and S5 removes the old secrets from Cloudflare, which ends any practical rollback. The success metric 'a scheduled run finishes with one login plus one page load' no longer matches the design. Also, accessibility is empty, which is fine for a Pushover-only app but should be stated as not applicable. Q2 (uncommitted README.md and src/index.ts edits) is non-blocking, yet S3 to S5 edit those same files, so work could be lost or conflict.",
+        "suggestion": "State that rollback means redeploying S4 with the previous snapshot discarded, and delay secret deletion until the new path has run cleanly for several days. Commit or stash the pending edits before S1. Reword the success metric.",
+        "resolution": "Fixed: rollout now says rollback is only to a previous new-format commit, and old secrets are kept a week only as a margin."
+      }
+    ]
+  },
+  "evidence": {
+    "brief_sha256": "8b51c62aeb425cf18f961f2ee2c1a4d0dcd2d8ea1c15e7275f591e982ba7f04d",
+    "cards": {
+      "O1": "e4469397292793be97cb8daa8fdbc3d0d2470bbff69d1824380a69bf2744d147",
+      "O2": "3a0f5816b3fe3c227cab0d6fd2967493b33f0c7fe0885ef0d5cb3d534ac04fcd",
+      "O3": "0df87edd6f7a625dff26f881ca330cd1802f17ae909b10795ca5fb17fb521f9a"
+    },
+    "critic_sha256": "a0150fb747c33ebfaead8a54a06215a27f855f95b2052fe34074edbd0185b0a2",
+    "critic_basis": {
+      "chosen_option": "O4",
+      "risk": "R3",
+      "contracts_sha256": "b724e4ed39a1c070",
+      "acs_sha256": "1c00fac2b7bfc238"
+    }
+  },
+  "handoff": {
+    "verified_diamond": {
+      "generated_by": "double-diamond dd_plan.py finalize",
+      "plan_revision": 1,
+      "plan_hash": "0e81bbd95b2901ba",
+      "base_revision": "834c86b0eeecf67d4af875f03d83eb0b17a26155",
+      "risk": "R3",
+      "freeze_first": [
+        {
+          "id": "C1",
+          "name": "Env bindings",
+          "kind": "config",
+          "definition": "Keep SNAPSHOTS, PUSHOVER_USER_KEY, PUSHOVER_APP_TOKEN, PUSHOVER_ERROR_APP_KEY, SOURCE_URL (https://www.thepokehive.com/pages/wholesale), DEFAULT_TIMEZONE. Add the secret POKEHIVE_SESSION_COOKIE. Remove ANTHROPIC_API_KEY, POKEHIVE_EMAIL, POKEHIVE_PASSWORD and LOGIN_URL. Remove BROWSER and @cloudflare/puppeteer unless S1 shows the list is rendered by JavaScript."
+        },
+        {
+          "id": "C2",
+          "name": "StoredState schema 2",
+          "kind": "data",
+          "definition": "KV key state: { schema: 2, fetchedAt: ISO string, lastChangeDate?: YYYY-MM-DD, lastErrorAlert?: { step, date }, sections: Record<heading, Record<name, { name, contents, unitPrice: number, casePrice: number or null }>> }. Read rules: null means first run (baseline). A legacy object with mainList and preOrders and no schema means a migration baseline. A schema 2 object is used as is. Any other shape, or a KV read error, is a step-state error: alert and stop, never baseline. KV key session holds { cookie, secretHash }, where secretHash is a SHA-256 of the POKEHIVE_SESSION_COOKIE secret it was derived from."
+        },
+        {
+          "id": "C3",
+          "name": "parseWholesale",
+          "kind": "function",
+          "definition": "parseWholesale(html: string): Catalog, synchronous and pure. It uses a pure-JavaScript HTML parser that runs both in Workers and in Node vitest (library chosen in S1, for example node-html-parser), not HTMLRewriter. It returns sections keyed by heading in page order. It throws ParseError on zero sections, zero rows, or a row whose unit price is not a finite number. The browser fallback passes page.content() to the same function."
+        },
+        {
+          "id": "C4",
+          "name": "Failure steps",
+          "kind": "alert",
+          "definition": "Error alerts name one step: session (logged-out page or redirect; includes renewal steps), page-load (non-2xx or network), parse (ParseError), suspect (partial-parse guard tripped), state (unreadable snapshot), delivery (Pushover failed). Each step alerts at most once per Eastern date, tracked in lastErrorAlert. The snapshot and session are never written on any failure. A later successful run clears lastErrorAlert."
+        }
+      ],
+      "draft_dag": [
+        {
+          "id": "S1",
+          "objective": "Session feasibility spike (go or no-go) and contracts: Locally under wrangler dev only, never deployed: the owner captures the Shop session cookie, and a spike route fetches SOURCE_URL with it (redirect manual). Exit criteria: (1) the list is present in the response, in the raw HTML or after browser render; (2) the same cookie still works from the Worker after at least 24 hours; (3) whether Set-Cookie rolls the session forward. Save a sanitised HTML fixture. Pin the positive logged-in marker (list container present and no login form) and the section and row selectors. Choose the HTML parser library and fix C1 to C4. If (1) or (2) fails, stop and re-plan.",
+          "dependencies": [],
+          "base_revision": "834c86b0eeecf67d4af875f03d83eb0b17a26155",
+          "worker_class": "builder",
+          "owned_paths": [
+            "test/fixtures/wholesale.html"
+          ],
+          "forbidden_paths": [],
+          "contracts": [
+            "C1 Env bindings (config): Keep SNAPSHOTS, PUSHOVER_USER_KEY, PUSHOVER_APP_TOKEN, PUSHOVER_ERROR_APP_KEY, SOURCE_URL (https://www.thepokehive.com/pages/wholesale), DEFAULT_TIMEZONE. Add the secret POKEHIVE_SESSION_COOKIE. Remove ANTHROPIC_API_KEY, POKEHIVE_EMAIL, POKEHIVE_PASSWORD and LOGIN_URL. Remove BROWSER and @cloudflare/puppeteer unless S1 shows the list is rendered by JavaScript.",
+            "C2 StoredState schema 2 (data): KV key state: { schema: 2, fetchedAt: ISO string, lastChangeDate?: YYYY-MM-DD, lastErrorAlert?: { step, date }, sections: Record<heading, Record<name, { name, contents, unitPrice: number, casePrice: number or null }>> }. Read rules: null means first run (baseline). A legacy object with mainList and preOrders and no schema means a migration baseline. A schema 2 object is used as is. Any other shape, or a KV read error, is a step-state error: alert and stop, never baseline. KV key session holds { cookie, secretHash }, where secretHash is a SHA-256 of the POKEHIVE_SESSION_COOKIE secret it was derived from.",
+            "C3 parseWholesale (function): parseWholesale(html: string): Catalog, synchronous and pure. It uses a pure-JavaScript HTML parser that runs both in Workers and in Node vitest (library chosen in S1, for example node-html-parser), not HTMLRewriter. It returns sections keyed by heading in page order. It throws ParseError on zero sections, zero rows, or a row whose unit price is not a finite number. The browser fallback passes page.content() to the same function.",
+            "C4 Failure steps (alert): Error alerts name one step: session (logged-out page or redirect; includes renewal steps), page-load (non-2xx or network), parse (ParseError), suspect (partial-parse guard tripped), state (unreadable snapshot), delivery (Pushover failed). Each step alerts at most once per Eastern date, tracked in lastErrorAlert. The snapshot and session are never written on any failure. A later successful run clears lastErrorAlert."
+          ],
+          "acceptance": [
+            "AC1: Given valid member credentials in Worker secrets, when a check runs, then the watcher reaches www.thepokehive.com/pages/wholesale as a logged-in member with the list visible, without a human entering a code on that run. A failed or expired session sends at most one error alert per failure step per day. The alert names the failed step and says how to renew access, and the stored snapshot and session stay unchanged."
+          ],
+          "verify": [],
+          "risk": "R3",
+          "retry_limit": 1,
+          "escalation": [
+            "contract ambiguity",
+            "needs unowned path",
+            "verification fails twice",
+            "shared interface change",
+            "high-risk issue discovered"
+          ]
+        },
+        {
+          "id": "S2",
+          "objective": "Pure parser with fixture tests: parseWholesale returns sections and rows from the fixture with the chosen pure parser, and throws ParseError on empty or invalid input. Add a partial-parse guard function covering a missing section, more than 50 percent row loss in a section, and a total drop over 30 percent. Add vitest and typecheck scripts.",
+          "dependencies": [
+            "S1"
+          ],
+          "base_revision": "834c86b0eeecf67d4af875f03d83eb0b17a26155",
+          "worker_class": "builder",
+          "owned_paths": [
+            "src/parse.ts",
+            "test/parse.test.ts",
+            "package.json"
+          ],
+          "forbidden_paths": [],
+          "contracts": [
+            "C3 parseWholesale (function): parseWholesale(html: string): Catalog, synchronous and pure. It uses a pure-JavaScript HTML parser that runs both in Workers and in Node vitest (library chosen in S1, for example node-html-parser), not HTMLRewriter. It returns sections keyed by heading in page order. It throws ParseError on zero sections, zero rows, or a row whose unit price is not a finite number. The browser fallback passes page.content() to the same function."
+          ],
+          "acceptance": [
+            "AC2: Given the logged-in wholesale page, when it is parsed, then every product row is captured with section, name, contents and price per unit (plus price per case when present), grouped under the page's own section headings, from a single page load with no image download and no Anthropic API call",
+            "AC5: Given the page loads but parses to zero rows or zero sections, or to a suspect partial result (a previously seen section is missing, any section loses more than half its rows, or the total drops by more than 30 percent), when a check runs, then an error alert is sent and the snapshot is not overwritten, so no false mass removal is reported"
+          ],
+          "verify": [],
+          "risk": "R1",
+          "retry_limit": 1,
+          "escalation": [
+            "contract ambiguity",
+            "needs unowned path",
+            "verification fails twice",
+            "shared interface change",
+            "high-risk issue discovered"
+          ]
+        },
+        {
+          "id": "S3",
+          "objective": "Session load, expiry check and rolling refresh: Authenticated page load with redirect manual (fetch, or the browser fallback per S1). Positive logged-in check using the S1 marker. Session precedence by secretHash. Refreshed cookies saved to KV only after a passing check and parse. Session alert with renewal steps, deduped per step per day.",
+          "dependencies": [
+            "S1"
+          ],
+          "base_revision": "834c86b0eeecf67d4af875f03d83eb0b17a26155",
+          "worker_class": "builder",
+          "owned_paths": [
+            "src/session.ts",
+            "src/index.ts"
+          ],
+          "forbidden_paths": [],
+          "contracts": [
+            "C1 Env bindings (config): Keep SNAPSHOTS, PUSHOVER_USER_KEY, PUSHOVER_APP_TOKEN, PUSHOVER_ERROR_APP_KEY, SOURCE_URL (https://www.thepokehive.com/pages/wholesale), DEFAULT_TIMEZONE. Add the secret POKEHIVE_SESSION_COOKIE. Remove ANTHROPIC_API_KEY, POKEHIVE_EMAIL, POKEHIVE_PASSWORD and LOGIN_URL. Remove BROWSER and @cloudflare/puppeteer unless S1 shows the list is rendered by JavaScript.",
+            "C4 Failure steps (alert): Error alerts name one step: session (logged-out page or redirect; includes renewal steps), page-load (non-2xx or network), parse (ParseError), suspect (partial-parse guard tripped), state (unreadable snapshot), delivery (Pushover failed). Each step alerts at most once per Eastern date, tracked in lastErrorAlert. The snapshot and session are never written on any failure. A later successful run clears lastErrorAlert."
+          ],
+          "acceptance": [
+            "AC1: Given valid member credentials in Worker secrets, when a check runs, then the watcher reaches www.thepokehive.com/pages/wholesale as a logged-in member with the list visible, without a human entering a code on that run. A failed or expired session sends at most one error alert per failure step per day. The alert names the failed step and says how to renew access, and the stored snapshot and session stay unchanged."
+          ],
+          "verify": [],
+          "risk": "R3",
+          "retry_limit": 1,
+          "escalation": [
+            "contract ambiguity",
+            "needs unowned path",
+            "verification fails twice",
+            "shared interface change",
+            "high-risk issue discovered"
+          ]
+        },
+        {
+          "id": "S4",
+          "objective": "Schema 2 state, baseline and per-section diff: runCheck uses schema 2 with explicit read rules: null or legacy means a baseline with a restart message, an unknown shape or read error means a state alert. Per-section diff on unit and case price. Partial-parse guard before any save. No save on any failure. lastErrorAlert dedupe. Status route updated.",
+          "dependencies": [
+            "S2",
+            "S3"
+          ],
+          "base_revision": "834c86b0eeecf67d4af875f03d83eb0b17a26155",
+          "worker_class": "builder",
+          "owned_paths": [
+            "src/index.ts"
+          ],
+          "forbidden_paths": [],
+          "contracts": [
+            "C2 StoredState schema 2 (data): KV key state: { schema: 2, fetchedAt: ISO string, lastChangeDate?: YYYY-MM-DD, lastErrorAlert?: { step, date }, sections: Record<heading, Record<name, { name, contents, unitPrice: number, casePrice: number or null }>> }. Read rules: null means first run (baseline). A legacy object with mainList and preOrders and no schema means a migration baseline. A schema 2 object is used as is. Any other shape, or a KV read error, is a step-state error: alert and stop, never baseline. KV key session holds { cookie, secretHash }, where secretHash is a SHA-256 of the POKEHIVE_SESSION_COOKIE secret it was derived from.",
+            "C4 Failure steps (alert): Error alerts name one step: session (logged-out page or redirect; includes renewal steps), page-load (non-2xx or network), parse (ParseError), suspect (partial-parse guard tripped), state (unreadable snapshot), delivery (Pushover failed). Each step alerts at most once per Eastern date, tracked in lastErrorAlert. The snapshot and session are never written on any failure. A later successful run clears lastErrorAlert."
+          ],
+          "acceptance": [
+            "AC3: Given a stored snapshot from the old image-based format, when the first run after deploy completes, then the old snapshot is replaced by a fresh baseline and exactly one watch restarted message lists the product count for each section, with no add or remove alerts",
+            "AC4: Given a baseline in the new format, when a product is added, removed or repriced in any section, then one Pushover alert lists those changes grouped by section heading, with a price change on either price per unit or price per case reported; unchanged runs send nothing",
+            "AC5: Given the page loads but parses to zero rows or zero sections, or to a suspect partial result (a previously seen section is missing, any section loses more than half its rows, or the total drops by more than 30 percent), when a check runs, then an error alert is sent and the snapshot is not overwritten, so no false mass removal is reported"
+          ],
+          "verify": [],
+          "risk": "R2",
+          "retry_limit": 1,
+          "escalation": [
+            "contract ambiguity",
+            "needs unowned path",
+            "verification fails twice",
+            "shared interface change",
+            "high-risk issue discovered"
+          ]
+        },
+        {
+          "id": "S5",
+          "objective": "Remove image, vision and old-site code and update docs: Delete the image and vision code and ANTHROPIC_API_KEY, the old login and LOGIN_URL, and Puppeteer plus BROWSER if unused. Update wrangler vars and the README secrets, URLs and renewal how-to.",
+          "dependencies": [
+            "S4"
+          ],
+          "base_revision": "834c86b0eeecf67d4af875f03d83eb0b17a26155",
+          "worker_class": "builder",
+          "owned_paths": [
+            "src/index.ts",
+            "wrangler.jsonc",
+            "package.json",
+            "README.md"
+          ],
+          "forbidden_paths": [],
+          "contracts": [
+            "C1 Env bindings (config): Keep SNAPSHOTS, PUSHOVER_USER_KEY, PUSHOVER_APP_TOKEN, PUSHOVER_ERROR_APP_KEY, SOURCE_URL (https://www.thepokehive.com/pages/wholesale), DEFAULT_TIMEZONE. Add the secret POKEHIVE_SESSION_COOKIE. Remove ANTHROPIC_API_KEY, POKEHIVE_EMAIL, POKEHIVE_PASSWORD and LOGIN_URL. Remove BROWSER and @cloudflare/puppeteer unless S1 shows the list is rendered by JavaScript."
+          ],
+          "acceptance": [
+            "AC6: Given the deployed Worker and README, when they are inspected, then no image or vision code, no ANTHROPIC_API_KEY and no thepokehivewholesale.com or Squarespace references remain; README lists the remaining secrets and the new URLs"
+          ],
+          "verify": [],
+          "risk": "R2",
+          "retry_limit": 1,
+          "escalation": [
+            "contract ambiguity",
+            "needs unowned path",
+            "verification fails twice",
+            "shared interface change",
+            "high-risk issue discovered"
+          ]
+        }
+      ],
+      "notes": [
+        "Run `python3 dd_plan.py verify <plan.json>` first: it proves the plan is final and unchanged since finalize.",
+        "verify[] is intentionally empty: fill it from the repository verified_diamond command contract, never from this plan.",
+        "owned_paths are planning drafts: re-verify against the current tree before delegating.",
+        "verified-diamond risk classification is authoritative; this plan's risk is an input."
+      ]
+    }
+  },
+  "run": {
+    "harness": "claude-code",
+    "session_key": "",
+    "question_rounds": 3,
+    "lane_changes": [
+      "quick to full: Define found two material unknowns - how the new Shopify customer login works (classic password form vs passwordless email code) and how the logged-in wholesale page marks up its sections and rows",
+      "risk R2 to R3: user confirmed login is Sign in with Shop (passwordless SSO), so unattended authentication and session handling are now in scope"
+    ]
+  }
+}

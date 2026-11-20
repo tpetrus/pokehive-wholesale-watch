@@ -6,10 +6,8 @@
   "scripts": {
     "dev": "wrangler dev",
     "deploy": "wrangler deploy",
-    "tail": "wrangler tail"
-  },
-  "dependencies": {
-    "@cloudflare/puppeteer": "^1.0.2"
+    "tail": "wrangler tail",
+    "build": "wrangler deploy --dry-run --outdir dist"
   },
   "devDependencies": {
     "@cloudflare/workers-types": "^5.20260903.1",
