@@ -65,7 +65,7 @@ that record. A failure never overwrites the stored snapshot.
 | `session` | The response was the logged-out view, or the server redirected. Renew the cookie (below). The alert includes the renewal steps. |
 | `page-load` | Non-2xx response, network error, or a body that is not JSON. |
 | `parse` | The JSON did not have the expected shape. |
-| `suspect` | The result looks partial versus the last snapshot: a previously seen section is missing, any section lost more than 50% of its items, or the total dropped by more than 30%. The alert lists the counts. If the change is real, hit `/run?accept=1`. |
+| `suspect` | The result looks partial versus the last snapshot: a previously seen section is missing, any section lost more than 50% of its items, or the total dropped by more than 30%. The alert lists the counts. If the change is real, hit `/run?accept=1` (with the run key). |
 | `state` | The stored snapshot is unreadable (KV error or unrecognized shape). The Worker stops rather than re-baselining. |
 | `delivery` | Pushover rejected the change alert. The snapshot is not advanced, so the same changes are re-detected and re-sent on the next run. |
 
@@ -81,6 +81,7 @@ wrangler secret put POKEHIVE_SESSION_COOKIE  # full Cookie request header, see b
 wrangler secret put PUSHOVER_USER_KEY        # your user key, from the Pushover dashboard
 wrangler secret put PUSHOVER_APP_TOKEN       # API token of an app created at pushover.net/apps/build
 wrangler secret put PUSHOVER_ERROR_APP_KEY   # API token of a second app, used only for failure alerts
+wrangler secret put RUN_KEY                  # long URL-safe random string (e.g. openssl rand -hex 32); required by /run and /test-error-alert
 ```
 
 The cookie is sent only to the host of `SOURCE_URL`, with redirects disabled. It
@@ -121,6 +122,14 @@ npm run tail     # stream logs from the deployed worker
 ## Endpoints
 
 - `GET /` — status: last check time and item counts per section.
+
+`/run` and `/test-error-alert` require the `RUN_KEY` secret, sent as an
+`Authorization: Bearer <key>` header (preferred, e.g.
+`curl -H "Authorization: Bearer $RUN_KEY" https://<worker>/run`) or as `?key=<key>`
+for use in a browser. A key in the URL can end up in browser history and request
+logs, so prefer the header. If an `Authorization: Bearer` header is present it is used and
+`?key=` is ignored. Without `RUN_KEY` set, both routes return 503.
+
 - `GET /run` — manually trigger a check (same logic as the cron; sends real notifications and updates the snapshot).
 - `GET /run?accept=1` — same, but if the partial-list guard (`suspect`) trips, save the current list as the new baseline. It never saves on a session, parse or page-load failure.
 - `GET /test-error-alert` — send a test alert through the failure-alert channel (separate Pushover app, high priority).

@@ -23,6 +23,8 @@ export interface Env {
   PUSHOVER_ERROR_APP_KEY?: string;
   SOURCE_URL: string;
   DEFAULT_TIMEZONE: string;
+  /** Shared key required by /run and /test-error-alert. If unset, those routes are refused. */
+  RUN_KEY?: string;
 }
 
 function formatTimestamp(iso: string, timeZone: string): string {
@@ -419,6 +421,42 @@ async function runCheck(
   return `${changeCount} changes found and notified at ${formatTimestamp(now, timeZone)}.`;
 }
 
+// ---------------------------------------------------------------------------
+// Access control for the manual routes
+// ---------------------------------------------------------------------------
+
+async function sha256(text: string): Promise<ArrayBuffer> {
+  return crypto.subtle.digest("SHA-256", new TextEncoder().encode(text));
+}
+
+// The key is accepted as "Authorization: Bearer <key>" (preferred) or "?key=<key>"
+// (convenient in a browser). Both sides are hashed first so the constant-time
+// comparison never leaks the key's length. Fails closed when RUN_KEY is unset.
+async function isAuthorized(request: Request, env: Env): Promise<boolean> {
+  const expected = env.RUN_KEY?.trim();
+  if (!expected) return false;
+  const header = request.headers.get("Authorization") ?? "";
+  const presented = header.startsWith("Bearer ")
+    ? header.slice("Bearer ".length).trim()
+    : (new URL(request.url).searchParams.get("key") ?? "");
+  if (!presented) return false;
+  const [a, b] = await Promise.all([sha256(presented), sha256(expected)]);
+  // Fixed-length (32-byte) digests compared without early exit.
+  const x = new Uint8Array(a);
+  const y = new Uint8Array(b);
+  let diff = 0;
+  for (let i = 0; i < x.length; i++) diff |= x[i] ^ y[i];
+  return diff === 0;
+}
+
+function unauthorized(env: Env): Response {
+  const configured = !!env.RUN_KEY?.trim();
+  return new Response(
+    configured ? "Unauthorized." : "RUN_KEY is not configured; manual routes are disabled.",
+    { status: configured ? 401 : 503, headers: { "content-type": "text/plain" } },
+  );
+}
+
 export default {
   async scheduled(_event: ScheduledEvent, env: Env, ctx: ExecutionContext): Promise<void> {
     const now = new Date();
@@ -443,6 +481,10 @@ export default {
   async fetch(request: Request, env: Env): Promise<Response> {
     const url = new URL(request.url);
     const timeZone = (request.cf?.timezone as string | undefined) ?? env.DEFAULT_TIMEZONE;
+
+    if ((url.pathname === "/test-error-alert" || url.pathname === "/run") && !(await isAuthorized(request, env))) {
+      return unauthorized(env);
+    }
 
     if (url.pathname === "/test-error-alert") {
       const delivered = await notify(
@@ -473,9 +515,9 @@ export default {
       } else if (read.kind === "error") {
         body = `Stored state is unreadable: ${read.message}`;
       } else if (read.kind === "migration") {
-        body = "Legacy snapshot found; hit /run to take a new baseline.";
+        body = "Legacy snapshot found; hit /run (with the run key) to take a new baseline.";
       } else {
-        body = "No snapshot yet; hit /run to take the first one.";
+        body = "No snapshot yet; hit /run (with the run key) to take the first one.";
       }
       return new Response(body, { headers: { "content-type": "text/plain" } });
     }

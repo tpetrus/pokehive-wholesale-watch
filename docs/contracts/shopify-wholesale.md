@@ -28,6 +28,10 @@ Keep: `SNAPSHOTS` (KV), `PUSHOVER_USER_KEY`, `PUSHOVER_APP_TOKEN`,
 `SOURCE_URL` var = `https://www.thepokehive.com/apps/wholesale/list`.
 Add secret `POKEHIVE_SESSION_COOKIE`: the full `Cookie` request-header value copied
 from the browser for a `www.thepokehive.com` request.
+Add secret `RUN_KEY` (amended 2026-11-20, review finding F2): required by `/run`
+(including `?accept=1`) and `/test-error-alert`, as `Authorization: Bearer <key>` or
+`?key=<key>`, compared in constant time over SHA-256 digests. Unset means those routes
+return 503 (fail closed). `GET /` stays public (counts only).
 Remove: `ANTHROPIC_API_KEY`, `POKEHIVE_EMAIL`, `POKEHIVE_PASSWORD`, `LOGIN_URL`,
 the `browser` binding (`BROWSER`) and the `@cloudflare/puppeteer` dependency.
 
