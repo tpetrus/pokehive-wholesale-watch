@@ -131,6 +131,6 @@ In the `SNAPSHOTS` KV namespace:
 
 - `state` — the latest snapshot (schema 2): fetch time, the Eastern date of the
   last notified change, and the items of each section keyed by `id`.
-- `lastErrorAlert` — `{ step, date }` of the most recent failure alert, used to
-  alert at most once per step per Eastern date. Deleted on the next successful
+- `lastErrorAlert` — `{ date, steps }`: the failed steps already alerted on that Eastern
+  date, used to alert at most once per step per Eastern date. Deleted on the next successful
   run.

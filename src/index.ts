@@ -177,21 +177,25 @@ async function fetchList(env: Env): Promise<unknown> {
   } catch {
     throw new PageLoadError("SOURCE_URL is not a valid URL");
   }
-  if (url.protocol !== "https:") throw new PageLoadError("SOURCE_URL must be https");
+  if (url.protocol !== "https:" || url.hostname !== "www.thepokehive.com") {
+    throw new PageLoadError("SOURCE_URL is not the expected PokeHive host");
+  }
 
   const headers: Record<string, string> = {
     "User-Agent": BROWSER_UA,
     Accept: "application/json",
   };
   const cookie = env.POKEHIVE_SESSION_COOKIE?.trim();
-  // The request goes to exactly the URL whose host was just checked above.
+  // The protocol and hostname of `url` were verified against the allow-list above,
+  // and the request below goes to exactly that URL.
   if (cookie) headers.Cookie = cookie;
 
   let res: Response;
   try {
     res = await fetch(url.toString(), { method: "GET", headers, redirect: "manual" });
   } catch (e) {
-    throw new PageLoadError(`Network error: ${(e as Error).message}`);
+    // Never forward e.message: runtime errors can quote header values (the cookie).
+    throw new PageLoadError(`Network error (${e instanceof Error ? e.name : "unknown"})`);
   }
   if (res.status >= 300 && res.status < 400) {
     throw new SessionError(`Redirected (HTTP ${res.status}); the session cookie is likely expired`);
@@ -283,13 +287,23 @@ async function failStep(env: Env, step: FailureStep, detail: string): Promise<st
   const summary = `${STEP_TITLES[step]}: ${detail}`;
   console.log(`failure [${step}] ${detail}`);
 
-  let last: { step?: string; date?: string } | null = null;
+  let steps: FailureStep[] = [];
   try {
-    last = await env.SNAPSHOTS.get<{ step?: string; date?: string }>("lastErrorAlert", "json");
+    const last = await env.SNAPSHOTS.get<unknown>("lastErrorAlert", "json");
+    if (
+      typeof last === "object" &&
+      last !== null &&
+      !Array.isArray(last) &&
+      (last as Record<string, unknown>).date === today &&
+      Array.isArray((last as Record<string, unknown>).steps) &&
+      ((last as Record<string, unknown>).steps as unknown[]).every((x) => typeof x === "string")
+    ) {
+      steps = (last as { steps: FailureStep[] }).steps;
+    }
   } catch {
     // Unreadable dedupe record: better to alert than to stay silent.
   }
-  if (last?.step === step && last?.date === today) {
+  if (steps.includes(step)) {
     return `${summary} (already alerted today)`;
   }
 
@@ -302,7 +316,7 @@ async function failStep(env: Env, step: FailureStep, detail: string): Promise<st
     .catch(() => false);
   if (delivered) {
     try {
-      await env.SNAPSHOTS.put("lastErrorAlert", JSON.stringify({ step, date: today }));
+      await env.SNAPSHOTS.put("lastErrorAlert", JSON.stringify({ date: today, steps: [...steps, step] }));
     } catch (e) {
       console.log(`lastErrorAlert write failed: ${(e as Error).message}`);
     }
