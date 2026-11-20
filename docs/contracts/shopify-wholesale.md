@@ -31,8 +31,12 @@ from the browser for a `www.thepokehive.com` request.
 Remove: `ANTHROPIC_API_KEY`, `POKEHIVE_EMAIL`, `POKEHIVE_PASSWORD`, `LOGIN_URL`,
 the `browser` binding (`BROWSER`) and the `@cloudflare/puppeteer` dependency.
 
-The cookie is sent only to the `SOURCE_URL` host, with `redirect: "manual"`. Its value
-is never logged, never included in an alert, and never written to KV.
+The cookie is sent only to the `SOURCE_URL` host, with `redirect: "manual"`, and only
+when that URL is `https:` with hostname exactly `www.thepokehive.com`. Its value is never
+logged, never included in an alert, and never written to KV. Error text from `fetch` or
+header construction is never forwarded (alerts, logs, HTTP responses use a fixed message
+plus the error's `name` only), since runtime errors can quote header values.
+(Amended 2026-11-20, review finding F4.)
 
 ## C2 StoredState schema 2 (data) - revised
 
@@ -55,8 +59,12 @@ interface StoredState {
 }
 ```
 
-KV key `lastErrorAlert`: `{ step: FailureStep; date: string }` (date = YYYY-MM-DD in
-DEFAULT_TIMEZONE). Kept separate so a failure never writes `state`. Deleted on success.
+KV key `lastErrorAlert`: `{ date: string; steps: FailureStep[] }` (date = YYYY-MM-DD in
+DEFAULT_TIMEZONE; steps = every step already alerted on that date). Kept separate so a
+failure never writes `state`. Deleted on success. A stored value of any other shape
+(including the earlier `{ step, date }`) is treated as empty.
+(Amended 2026-11-20, review finding F1: a single `{ step, date }` let alternating steps
+re-alert the same step on one date, violating AC1.)
 
 Read rules for `state`: `null` means first run (baseline). A legacy object (has `mainList` or
 `preOrders`, no `schema`) means migration baseline. `schema === 2` is used as is.
@@ -95,7 +103,8 @@ keys are category `name`s in response order; item keys are `id`.
 - `delivery`: Pushover rejected the change alert.
 
 Each step alerts at most once per Eastern date, tracked in KV key `lastErrorAlert`
-(a different step on the same date does alert). `state` is never written on any failure.
+(a different step on the same date does alert; a step is added to `steps` only after its
+alert was delivered; a new date resets `steps`). `state` is never written on any failure.
 A later successful run deletes `lastErrorAlert`.
 
 ## Diff and alert format (AC4, D8 as clarified 2026-11-19)
