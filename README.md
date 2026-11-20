@@ -1,87 +1,102 @@
 # pokehive-wholesale-watch
 
-Cloudflare Worker that checks
-[thepokehivewholesale.com](https://www.thepokehivewholesale.com/member-site-homepage-2-2-1)'s
-member-only wholesale list every hour, 10am-8pm Eastern on weekdays, and
+Cloudflare Worker that checks [The Pokehive](https://www.thepokehive.com)'s
+members-only wholesale list every hour, 10am-8pm Eastern on weekdays, and
 pushes a [Pushover](https://pushover.net) notification when a product is added,
-removed, or has a price change — across the main wholesale list and the
-Pre-Orders section. Once a change is found and successfully notified, the
-rest of that day's checks are skipped (hourly checks resume the next day).
+removed, or has a price or unit change. Once a change is found and successfully
+notified, the rest of that day's checks are skipped (hourly checks resume the
+next day).
 
-## Why this one looks different from `wholesale-pokemon-watch`
+## How it works
 
-This site is nothing like the other watcher:
+The wholesale list is served as JSON by a Shopify app-proxy endpoint:
 
-- **Real password login.** The site's member auth runs through Squarespace's
-  own client-side JS against an undocumented internal endpoint (no stable
-  API to call directly), so this Worker drives an actual headless browser
-  ([Cloudflare Browser Rendering](https://developers.cloudflare.com/browser-run/)
-  via `@cloudflare/puppeteer`) to log in like a real user: fill
-  `#login-email` / `#login-password`, click the submit button, wait for
-  navigation.
-- **The product list is a picture, not text.** The "Today's list" and
-  "Pre Orders" tables aren't HTML — they're screenshots (PNGs) the site
-  owner uploads manually, e.g. `Screenshot+2026-09-11+094720.png`. There's
-  nothing to regex-parse. Reading them requires vision: this Worker sends
-  the image to the Claude API and asks for structured JSON back.
-- **The browser's job ends early.** The list images turn out to be
-  publicly fetchable once you know the URL (Squarespace's CDN doesn't gate
-  by cookie — only the *page* that reveals the URL is login-gated). So
-  Puppeteer is only used for login + finding the current image URLs; the
-  actual image download and Claude API call happen over plain `fetch`,
-  after the browser is already closed. This keeps Browser Rendering usage
-  (capped at 10 min/day on the Workers Free plan) to just login+navigate.
+```
+GET https://www.thepokehive.com/apps/wholesale/list
+```
 
-### Page layout (as of the site's current design)
+No HTML parsing and no browser are involved. The Worker sends one request with
+your logged-in session cookie and reads the response:
 
-The member page has 4 large images, in DOM order:
+- Logged in: `showPrices: true` and real prices (integer cents).
+- Logged out: the same list, but `showPrices: false` and every price `0`. The
+  Worker treats this as an expired session and never compares it against the
+  stored snapshot.
 
-1. Main wholesale list, part 1
-2. Main wholesale list, part 2 (sometimes a stale/reused screenshot from a
-   prior day if that half of the list didn't change)
-3. **Pre-Orders** table — but the same screenshot also contains the start
-   of an out-of-scope "Chinese"/Gem/Jumbo section beneath it, so the
-   extraction prompt for this image explicitly tells Claude to extract
-   only the Pre-Orders rows and ignore the rest.
-4. More of the Chinese/Jumbo section — out of scope, not read at all.
-
-If the site's layout changes (more/fewer images, sections reordered),
-`discoverImages` in `src/index.ts` will need updating — it currently
-assumes this fixed order.
+The list has 6 sections (categories), such as "English Pokémon". Each item has a
+unique `id`, a `name`, a `unit` (Pack, Case, Display, Box), a `price`, and an
+optional note. Names are not unique within a section (the same name can appear
+as both a Case and a Display), so items are tracked by `id`.
 
 ### Change detection
 
-Each image's filename encodes its upload timestamp. Every run, the Worker
-compares the current filenames against what's stored in KV from the last
-run:
+Changes are computed per section, by `id`:
 
-- Unchanged → reuse the stored catalog for that section, skip the Claude
-  call entirely. This is the common case and keeps API spend near zero.
-- Changed → download the image and re-extract via Claude vision.
+- **Added**: an `id` that was not in the section before.
+- **Removed**: an `id` that is no longer in the section.
+- **Changed**: same `id`, but `price` or `unit` differs.
 
-The main list's two images are treated as one combined catalog (if either
-half's image changed, both are re-extracted and merged) since a product
-could shift between the two screenshots as the list grows or shrinks.
+Note, badge, stock-left and minimum-quantity changes do not alert. A product
+whose `id` moves between sections is reported as removed from one and added to
+the other. The alert is one Pushover message (split on line boundaries into
+parts if over 1024 characters), grouped by section heading, with NEW, PRICE
+CHANGES and REMOVED blocks. Example:
 
-### Failure modes
+```
+💰 PRICE CHANGES (1)
+English Pokémon
+• 30th Celebration Booster Bundle
+   $1,500.00 → $1,550.00 / Case  (↑ $50.00) · $62.00 per unit
+```
 
-- **Login fails** (selector missing, still on the login page after
-  submit): sends a distinct "login failed" notification rather than
-  failing silently — likely a credential problem or the site changed its
-  login form.
-- **Extraction fails** (Claude's response isn't parseable JSON, image
-  download fails, or zero products come back): sends a distinct
-  "extraction failed" notification and skips diffing that section for the
-  run, without crashing the whole check.
-- **Check crashes** (unhandled error in a scheduled run): sends a
-  "check crashed" notification.
-- **Delivery fails** (Pushover rejects the change alert): the snapshot is
-  *not* advanced, so the same changes are re-detected and re-sent on the
-  next run, and a "notification failed" alert is attempted.
+The first run (and the first run after upgrading from the old image-based
+snapshot) stores a baseline and sends exactly one "watch restarted" message with
+the item count per section. It sends no added/removed alerts.
 
-All failure alerts are sent under a separate Pushover app (`PUSHOVER_ERROR_APP_KEY`)
-at high priority with the siren sound so
-they stand out from normal list updates.
+### Failure steps
+
+Every failure is classified into one step and sent under the separate failure
+Pushover app (`PUSHOVER_ERROR_APP_KEY`) at high priority with the siren sound.
+Each step alerts at most once per Eastern date. A later successful run clears
+that record. A failure never overwrites the stored snapshot.
+
+| Step | Meaning |
+| --- | --- |
+| `session` | The response was the logged-out view, or the server redirected. Renew the cookie (below). The alert includes the renewal steps. |
+| `page-load` | Non-2xx response, network error, or a body that is not JSON. |
+| `parse` | The JSON did not have the expected shape. |
+| `suspect` | The result looks partial versus the last snapshot: a previously seen section is missing, any section lost more than 50% of its items, or the total dropped by more than 30%. The alert lists the counts. If the change is real, hit `/run?accept=1`. |
+| `state` | The stored snapshot is unreadable (KV error or unrecognized shape). The Worker stops rather than re-baselining. |
+| `delivery` | Pushover rejected the change alert. The snapshot is not advanced, so the same changes are re-detected and re-sent on the next run. |
+
+An unhandled crash in a scheduled run sends a "check crashed" alert.
+
+## Required secrets
+
+Set these yourself via `wrangler secret put <NAME>` (never commit them, never
+paste them into chat; the prompt is masked and only you see the value):
+
+```
+wrangler secret put POKEHIVE_SESSION_COOKIE  # full Cookie request header, see below
+wrangler secret put PUSHOVER_USER_KEY        # your user key, from the Pushover dashboard
+wrangler secret put PUSHOVER_APP_TOKEN       # API token of an app created at pushover.net/apps/build
+wrangler secret put PUSHOVER_ERROR_APP_KEY   # API token of a second app, used only for failure alerts
+```
+
+The cookie is sent only to the host of `SOURCE_URL`, with redirects disabled. It
+is never logged, never included in an alert, and never stored in KV.
+
+### Capturing and renewing the cookie
+
+1. Use a dedicated browser profile for this, and sign in to
+   www.thepokehive.com with Shop. Do not log out afterward: logging out
+   invalidates the session.
+2. Open DevTools, go to the Network tab, and reload the site.
+3. Click any request to `www.thepokehive.com` and copy the **full `Cookie`
+   request header value** (all cookies, not a single one).
+4. Run `wrangler secret put POKEHIVE_SESSION_COOKIE` and paste the value.
+
+Renew the same way when a `session` alert arrives.
 
 ## Notifications
 
@@ -90,36 +105,14 @@ Messages are capped at 1024 characters, so long change lists are split into
 several messages titled "(1/3)", "(2/3)", and so on.
 
 Pushover replaced ntfy.sh because ntfy rate-limits by source IP, and
-Cloudflare Workers share egress IPs — the shared quota was exhausted, so the
-Worker's alerts were rejected with 429 even when authenticated (a free ntfy
-account is still IP-based: `"basis":"ip"`).
-
-## Required secrets
-
-Set these yourself via `wrangler secret put <NAME>` (never commit them,
-never paste them into chat — the prompt is masked and only you see the
-value):
-
-```
-wrangler secret put POKEHIVE_EMAIL
-wrangler secret put POKEHIVE_PASSWORD
-wrangler secret put ANTHROPIC_API_KEY
-wrangler secret put PUSHOVER_USER_KEY    # your user key, from the Pushover dashboard
-wrangler secret put PUSHOVER_APP_TOKEN   # API token of an app created at pushover.net/apps/build
-wrangler secret put PUSHOVER_ERROR_APP_KEY  # API token of a second app, used only for failure alerts
-```
-
-`ANTHROPIC_API_KEY` is a real Anthropic API key from
-[console.anthropic.com](https://console.anthropic.com/) — separate from a
-Claude subscription — used to pay for the vision extraction calls
-(model: `claude-opus-5`). Cost is low in practice since extraction only
-runs when a tracked image's filename actually changes.
+Cloudflare Workers share egress IPs, so the shared quota was exhausted and the
+Worker's alerts were rejected with 429 even when authenticated.
 
 ## Develop
 
 ```
 npm install
-npm run dev      # local dev server (uses real Browser Rendering + a real login)
+npm run dev      # local dev server
 npm run build    # bundle without deploying (wrangler deploy --dry-run); the verification gate
 npm run deploy   # deploy to Cloudflare
 npm run tail     # stream logs from the deployed worker
@@ -127,12 +120,17 @@ npm run tail     # stream logs from the deployed worker
 
 ## Endpoints
 
-- `GET /` — status: last check time + product counts per section.
+- `GET /` — status: last check time and item counts per section.
 - `GET /run` — manually trigger a check (same logic as the cron; sends real notifications and updates the snapshot).
+- `GET /run?accept=1` — same, but if the partial-list guard (`suspect`) trips, save the current list as the new baseline. It never saves on a session, parse or page-load failure.
 - `GET /test-error-alert` — send a test alert through the failure-alert channel (separate Pushover app, high priority).
 
 ## Storage
 
-A single JSON blob (`state`) in the `SNAPSHOTS` KV namespace holds the
-most recent catalog + image filenames for both the main list and
-Pre-Orders sections.
+In the `SNAPSHOTS` KV namespace:
+
+- `state` — the latest snapshot (schema 2): fetch time, the Eastern date of the
+  last notified change, and the items of each section keyed by `id`.
+- `lastErrorAlert` — `{ step, date }` of the most recent failure alert, used to
+  alert at most once per step per Eastern date. Deleted on the next successful
+  run.

@@ -1,48 +1,28 @@
-import puppeteer from "@cloudflare/puppeteer";
+import {
+  type Catalog,
+  type FailureStep,
+  type StoredState,
+  ParseError,
+  SessionError,
+  countChanges,
+  diffCatalogs,
+  formatCounts,
+  formatDiff,
+  parseWholesale,
+  suspectReason,
+  totalItems,
+} from "./wholesale";
 
 export interface Env {
   SNAPSHOTS: KVNamespace;
-  BROWSER: Fetcher;
-  POKEHIVE_EMAIL: string;
-  POKEHIVE_PASSWORD: string;
-  ANTHROPIC_API_KEY: string;
+  /** Full Cookie request-header value copied from a www.thepokehive.com request. */
+  POKEHIVE_SESSION_COOKIE: string;
   PUSHOVER_USER_KEY: string;
   PUSHOVER_APP_TOKEN: string;
   /** Separate Pushover app for failure alerts; falls back to PUSHOVER_APP_TOKEN. */
   PUSHOVER_ERROR_APP_KEY?: string;
-  LOGIN_URL: string;
   SOURCE_URL: string;
   DEFAULT_TIMEZONE: string;
-}
-
-interface ProductInfo {
-  name: string;
-  contents: string;
-  pricePerUnit: number;
-  pricePerCase: number | null;
-}
-
-type Catalog = Record<string, ProductInfo>;
-
-interface SectionState {
-  /** CDN image filename(s) this catalog was last extracted from. */
-  imageIds: string[];
-  products: Catalog;
-}
-
-interface StoredState {
-  fetchedAt: string;
-  mainList: SectionState;
-  preOrders: SectionState;
-  /** Eastern calendar date (YYYY-MM-DD) a change was last found and notified;
-   *  scheduled checks are skipped for the rest of that date. */
-  lastChangeDate?: string;
-}
-
-const EMPTY_SECTION: SectionState = { imageIds: [], products: {} };
-
-function money(n: number): string {
-  return `$${n.toFixed(2)}`;
 }
 
 function formatTimestamp(iso: string, timeZone: string): string {
@@ -150,7 +130,7 @@ async function notifyError(env: Env, title: string, body: string): Promise<void>
 // ---------------------------------------------------------------------------
 // Working-hours gate: 10am-8pm Eastern, Monday-Friday. The cron fires hourly
 // every day (Cloudflare crons can't express a timezone or weekdays alongside
-// DST), so this check is what actually keeps the browser from launching
+// DST), so this check is what actually keeps the Worker from fetching
 // outside the intended window.
 // ---------------------------------------------------------------------------
 
@@ -181,406 +161,247 @@ function dateStringInTimeZone(date: Date, timeZone: string): string {
 }
 
 // ---------------------------------------------------------------------------
-// Browser automation: log in as a real user (the site's member auth is
-// undocumented client-side JS, not a stable API) and discover the current
-// list-image URLs. The images themselves turn out to be publicly fetchable
-// once you know the URL, so the browser's job ends here — downloading and
-// vision extraction happen over plain fetch, keeping Browser Rendering
-// usage (and its free-tier minutes-per-day cap) to just login + navigate.
+// Fetching the list. The session cookie is attached only to SOURCE_URL's own
+// host, never follows a redirect, and is never logged, alerted or stored.
 // ---------------------------------------------------------------------------
 
-interface DiscoveredImages {
-  mainList: [string, string]; // two CDN image URLs, DOM order
-  preOrders: string; // third image URL (also contains an out-of-scope section)
-}
+class PageLoadError extends Error {}
 
-async function autoScroll(page: import("@cloudflare/puppeteer").Page): Promise<void> {
-  await page.evaluate(async () => {
-    const step = 800;
-    const delay = (ms: number) => new Promise((r) => setTimeout(r, ms));
-    let scrolled = 0;
-    while (scrolled < document.body.scrollHeight) {
-      window.scrollBy(0, step);
-      scrolled += step;
-      await delay(150);
-    }
-  });
-}
+const BROWSER_UA =
+  "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36";
 
-async function findFrameBySelector(
-  page: import("@cloudflare/puppeteer").Page,
-  selector: string,
-  timeoutMs: number,
-): Promise<import("@cloudflare/puppeteer").Frame | null> {
-  const deadline = Date.now() + timeoutMs;
-  while (Date.now() < deadline) {
-    for (const frame of page.frames()) {
-      if (await frame.$(selector).catch(() => null)) return frame;
-    }
-    await new Promise((r) => setTimeout(r, 300));
-  }
-  return null;
-}
-
-async function discoverImages(env: Env): Promise<DiscoveredImages> {
-  const browser = await puppeteer.launch(env.BROWSER);
+async function fetchList(env: Env): Promise<unknown> {
+  let url: URL;
   try {
-    const page = await browser.newPage();
-
-    await page.goto(env.LOGIN_URL, { waitUntil: "networkidle0" });
-
-    // The login form is rendered inside a same-origin iframe (/account/frame),
-    // not the top-level document — page.waitForSelector only searches the
-    // main frame, so the form's inputs have to be found on the iframe itself.
-    const loginFrame = await findFrameBySelector(page, "#login-email", 15000);
-    if (!loginFrame) {
-      const title = await page.title().catch(() => "?");
-      throw new Error(
-        `Could not find the login form (#login-email) in any frame (url=${page.url()}, title="${title}")`,
-      );
-    }
-
-    await loginFrame.type("#login-email", env.POKEHIVE_EMAIL);
-    await loginFrame.type("#login-password", env.POKEHIVE_PASSWORD);
-    await Promise.all([
-      page.waitForNavigation({ waitUntil: "networkidle0", timeout: 20000 }),
-      // The submit click can race the resulting top-level navigation, which
-      // tears down/replaces this iframe before the click command's own
-      // confirmation comes back — Puppeteer then reports "Navigating frame
-      // was detached" even though login succeeded. That's benign here since
-      // page.waitForNavigation (and the login-page check below) are what
-      // actually gate success; only a genuinely different click failure
-      // should abort the run.
-      loginFrame.click("button[type=submit]").catch((e) => {
-        if (!/detached/i.test((e as Error).message)) throw e;
-      }),
-    ]);
-
-    if (page.url().includes("/account/login")) {
-      throw new Error("Still on login page after submit — login likely failed.");
-    }
-
-    await page.goto(env.SOURCE_URL, { waitUntil: "networkidle0" });
-    await autoScroll(page);
-
-    const imageUrls = await page.evaluate(() => {
-      const imgs = Array.from(document.querySelectorAll<HTMLImageElement>("img"));
-      return imgs
-        .filter(
-          (img) =>
-            img.naturalWidth > 100 &&
-            img.src.includes("images.squarespace-cdn.com") &&
-            // Header/footer logos are also CDN images; the list images are
-            // uploaded screenshots.
-            !/logo/i.test(decodeURIComponent(img.src.split("?")[0])),
-        )
-        .map((img) => img.src);
-    });
-
-    if (imageUrls.length < 3) {
-      throw new Error(
-        `Expected at least 3 tracked images on the member page, found ${imageUrls.length}.`,
-      );
-    }
-
-    return { mainList: [imageUrls[0], imageUrls[1]], preOrders: imageUrls[2] };
-  } finally {
-    await browser.close();
+    url = new URL(env.SOURCE_URL);
+  } catch {
+    throw new PageLoadError("SOURCE_URL is not a valid URL");
   }
-}
+  if (url.protocol !== "https:") throw new PageLoadError("SOURCE_URL must be https");
 
-function imageFilename(url: string): string {
-  return new URL(url).pathname.split("/").pop() ?? url;
-}
-
-// ---------------------------------------------------------------------------
-// Vision extraction via the Claude API. Only called for images whose
-// filename changed since the last run (see runCheck) — most runs reuse the
-// previously stored catalog and skip this entirely.
-// ---------------------------------------------------------------------------
-
-const EXTRACTION_PROMPT_MAIN = `This image is a screenshot of a spreadsheet listing wholesale Pokemon TCG products for sale.
-
-Extract every product row into a JSON array. Skip the legend rows at the very top that explain what the highlight colors mean (they start with "This color means..."). Skip any blank rows.
-
-Each array element must have exactly these fields:
-- "name": the product name, exactly as written
-- "contents": the contents/notes column text (e.g. "6 units per case"), or "" if empty
-- "pricePerUnit": the "Price per unit" column as a number, or null if blank
-- "pricePerCase": the "Price per case" column as a number, or null if blank
-
-Respond with ONLY the JSON array, no other text, no markdown code fences.`;
-
-const EXTRACTION_PROMPT_PRE_ORDERS = `This image is a screenshot of a spreadsheet. It may contain multiple sections stacked vertically, but you must extract ONLY the rows that fall under the "PRE ORDERS" heading (product names like set/box/case pre-order listings, typically near the top of the image).
-
-Ignore and do NOT include rows under any other heading in the same image, such as "Chinese", "Gem", "Jumbo", or "151 Products" sections — those are out of scope.
-
-Extract the in-scope rows into a JSON array. Skip blank rows. Each array element must have exactly these fields:
-- "name": the product name, exactly as written
-- "contents": the contents/notes column text, or "" if empty
-- "pricePerUnit": the "Price per unit" column as a number, or null if blank
-- "pricePerCase": the "Price per case" column as a number, or null if blank
-
-Respond with ONLY the JSON array, no other text, no markdown code fences.`;
-
-class ExtractionError extends Error {}
-
-function parseJsonArray(text: string): unknown[] {
-  const cleaned = text
-    .trim()
-    .replace(/^```(?:json)?\s*/i, "")
-    .replace(/```\s*$/i, "");
-  const parsed = JSON.parse(cleaned);
-  if (!Array.isArray(parsed)) throw new Error("Expected a JSON array");
-  return parsed;
-}
-
-async function extractCatalog(env: Env, imageUrl: string, prompt: string): Promise<Catalog> {
-  const imageRes = await fetch(imageUrl);
-  if (!imageRes.ok) {
-    throw new ExtractionError(`Failed to download list image: ${imageRes.status}`);
-  }
-  const imageBytes = new Uint8Array(await imageRes.arrayBuffer());
-  let binary = "";
-  for (let i = 0; i < imageBytes.length; i++) binary += String.fromCharCode(imageBytes[i]);
-  const base64 = btoa(binary);
-
-  const apiRes = await fetch("https://api.anthropic.com/v1/messages", {
-    method: "POST",
-    headers: {
-      "x-api-key": env.ANTHROPIC_API_KEY,
-      "anthropic-version": "2023-06-01",
-      "content-type": "application/json",
-    },
-    body: JSON.stringify({
-      model: "claude-opus-5",
-      max_tokens: 4096,
-      messages: [
-        {
-          role: "user",
-          content: [
-            { type: "image", source: { type: "base64", media_type: "image/png", data: base64 } },
-            { type: "text", text: prompt },
-          ],
-        },
-      ],
-    }),
-  });
-
-  if (!apiRes.ok) {
-    throw new ExtractionError(`Claude API error: ${apiRes.status} ${await apiRes.text()}`);
-  }
-
-  const body = (await apiRes.json()) as {
-    content: Array<{ type: string; text?: string }>;
+  const headers: Record<string, string> = {
+    "User-Agent": BROWSER_UA,
+    Accept: "application/json",
   };
-  const textBlock = body.content.find((b) => b.type === "text");
-  if (!textBlock?.text) throw new ExtractionError("Claude response had no text block");
+  const cookie = env.POKEHIVE_SESSION_COOKIE?.trim();
+  // The request goes to exactly the URL whose host was just checked above.
+  if (cookie) headers.Cookie = cookie;
 
-  let rows: unknown[];
+  let res: Response;
   try {
-    rows = parseJsonArray(textBlock.text);
+    res = await fetch(url.toString(), { method: "GET", headers, redirect: "manual" });
   } catch (e) {
-    throw new ExtractionError(`Failed to parse extraction JSON: ${(e as Error).message}`);
+    throw new PageLoadError(`Network error: ${(e as Error).message}`);
   }
-
-  const catalog: Catalog = {};
-  for (const row of rows) {
-    if (typeof row !== "object" || row === null) continue;
-    const r = row as Record<string, unknown>;
-    const name = typeof r.name === "string" ? r.name.trim() : "";
-    const pricePerUnit = typeof r.pricePerUnit === "number" ? r.pricePerUnit : NaN;
-    if (!name || !Number.isFinite(pricePerUnit)) continue;
-    catalog[name] = {
-      name,
-      contents: typeof r.contents === "string" ? r.contents : "",
-      pricePerUnit,
-      pricePerCase: typeof r.pricePerCase === "number" ? r.pricePerCase : null,
-    };
+  if (res.status >= 300 && res.status < 400) {
+    throw new SessionError(`Redirected (HTTP ${res.status}); the session cookie is likely expired`);
   }
-  if (Object.keys(catalog).length === 0) {
-    throw new ExtractionError(`Extraction returned no products for ${imageFilename(imageUrl)}`);
+  if (!res.ok) throw new PageLoadError(`HTTP ${res.status}`);
+  try {
+    return JSON.parse(await res.text());
+  } catch {
+    throw new PageLoadError("Response body was not valid JSON");
   }
-  return catalog;
 }
 
 // ---------------------------------------------------------------------------
-// Diffing + notification formatting (mirrors wholesale-pokemon-watch: only
-// additions, removals, and price changes are worth a notification).
+// State access (contract C2)
 // ---------------------------------------------------------------------------
 
-interface Diff {
-  added: Array<{ name: string; info: ProductInfo }>;
-  removed: Array<{ name: string; info: ProductInfo }>;
-  priceChanges: Array<{ name: string; from: number; to: number }>;
-}
+type StateRead =
+  | { kind: "baseline" }
+  | { kind: "migration" }
+  | { kind: "ok"; state: StoredState }
+  | { kind: "error"; message: string };
 
-function diffCatalogs(previous: Catalog, current: Catalog): Diff {
-  const diff: Diff = { added: [], removed: [], priceChanges: [] };
-
-  for (const [name, info] of Object.entries(current)) {
-    const prior = previous[name];
-    if (!prior) {
-      diff.added.push({ name, info });
-      continue;
+function isSchema2(v: unknown): v is StoredState {
+  if (typeof v !== "object" || v === null) return false;
+  const s = v as Record<string, unknown>;
+  if (s.schema !== 2 || typeof s.fetchedAt !== "string") return false;
+  if (s.lastChangeDate !== undefined && typeof s.lastChangeDate !== "string") return false;
+  if (typeof s.sections !== "object" || s.sections === null || Array.isArray(s.sections)) {
+    return false;
+  }
+  for (const items of Object.values(s.sections as Record<string, unknown>)) {
+    if (typeof items !== "object" || items === null || Array.isArray(items)) return false;
+    for (const it of Object.values(items as Record<string, unknown>)) {
+      if (typeof it !== "object" || it === null) return false;
+      const i = it as Record<string, unknown>;
+      if (
+        typeof i.id !== "string" ||
+        typeof i.name !== "string" ||
+        typeof i.unit !== "string" ||
+        typeof i.price !== "number"
+      ) {
+        return false;
+      }
     }
-    if (prior.pricePerUnit !== info.pricePerUnit) {
-      diff.priceChanges.push({ name, from: prior.pricePerUnit, to: info.pricePerUnit });
+  }
+  return true;
+}
+
+async function readState(env: Env): Promise<StateRead> {
+  let raw: unknown;
+  try {
+    raw = await env.SNAPSHOTS.get("state", "json");
+  } catch (e) {
+    return { kind: "error", message: `KV read failed: ${(e as Error).message}` };
+  }
+  if (raw === null) return { kind: "baseline" };
+  if (isSchema2(raw)) return { kind: "ok", state: raw };
+  if (typeof raw === "object" && !Array.isArray(raw)) {
+    const o = raw as Record<string, unknown>;
+    if (o.schema === undefined && ("mainList" in o || "preOrders" in o)) {
+      return { kind: "migration" };
     }
   }
-  for (const [name, info] of Object.entries(previous)) {
-    if (!current[name]) diff.removed.push({ name, info });
-  }
-  return diff;
+  return { kind: "error", message: "Stored state has an unrecognized shape" };
 }
 
-function isDiffEmpty(diff: Diff): boolean {
-  return diff.added.length === 0 && diff.removed.length === 0 && diff.priceChanges.length === 0;
+// ---------------------------------------------------------------------------
+// Failure alerts: once per step per Eastern date, tracked in KV `lastErrorAlert`
+// (never in `state`).
+// ---------------------------------------------------------------------------
+
+const SESSION_RENEWAL_STEPS =
+  "To renew:\n" +
+  "1. Sign in with Shop at www.thepokehive.com in the dedicated browser profile.\n" +
+  "2. In DevTools > Network, open a www.thepokehive.com request and copy the full Cookie request header.\n" +
+  "3. Run: wrangler secret put POKEHIVE_SESSION_COOKIE and paste it.";
+
+const STEP_TITLES: Record<FailureStep, string> = {
+  session: "session expired",
+  "page-load": "page load failed",
+  parse: "parse failed",
+  suspect: "list looks incomplete",
+  state: "stored state unreadable",
+  delivery: "notification failed",
+};
+
+async function failStep(env: Env, step: FailureStep, detail: string): Promise<string> {
+  const today = dateStringInTimeZone(new Date(), env.DEFAULT_TIMEZONE);
+  const summary = `${STEP_TITLES[step]}: ${detail}`;
+  console.log(`failure [${step}] ${detail}`);
+
+  let last: { step?: string; date?: string } | null = null;
+  try {
+    last = await env.SNAPSHOTS.get<{ step?: string; date?: string }>("lastErrorAlert", "json");
+  } catch {
+    // Unreadable dedupe record: better to alert than to stay silent.
+  }
+  if (last?.step === step && last?.date === today) {
+    return `${summary} (already alerted today)`;
+  }
+
+  let body = detail;
+  if (step === "session") body += `\n\n${SESSION_RENEWAL_STEPS}`;
+  if (step === "suspect") {
+    body += "\n\nIf this change is real, hit /run?accept=1 to save the current list as the new baseline.";
+  }
+  const delivered = await notify(env, `PokeHive watch: ${STEP_TITLES[step]}`, `WARNING\n${body}`, true)
+    .catch(() => false);
+  if (delivered) {
+    try {
+      await env.SNAPSHOTS.put("lastErrorAlert", JSON.stringify({ step, date: today }));
+    } catch (e) {
+      console.log(`lastErrorAlert write failed: ${(e as Error).message}`);
+    }
+  }
+  return summary;
 }
 
-function formatDiffSection(label: string, diff: Diff): string {
-  const sections: string[] = [];
-
-  if (diff.added.length > 0) {
-    const lines = diff.added.map((a) => `• ${a.info.name} — ${money(a.info.pricePerUnit)}`);
-    sections.push(`🆕 NEW (${diff.added.length})\n${lines.join("\n")}`);
+async function clearErrorAlert(env: Env): Promise<void> {
+  try {
+    await env.SNAPSHOTS.delete("lastErrorAlert");
+  } catch (e) {
+    console.log(`lastErrorAlert delete failed: ${(e as Error).message}`);
   }
-  if (diff.priceChanges.length > 0) {
-    const lines = diff.priceChanges.map((c) => {
-      const arrow = c.to > c.from ? "↑" : "↓";
-      const delta = money(Math.abs(c.to - c.from));
-      return `• ${c.name}\n   ${money(c.from)} → ${money(c.to)}  (${arrow} ${delta})`;
-    });
-    sections.push(`💰 PRICE CHANGES (${diff.priceChanges.length})\n${lines.join("\n")}`);
-  }
-  if (diff.removed.length > 0) {
-    const lines = diff.removed.map((r) => `• ${r.info.name}`);
-    sections.push(`❌ REMOVED (${diff.removed.length})\n${lines.join("\n")}`);
-  }
-
-  return `${label}\n${sections.join("\n\n")}`;
 }
 
 // ---------------------------------------------------------------------------
 // Main check
 // ---------------------------------------------------------------------------
 
-async function runCheck(env: Env, timeZone: string = env.DEFAULT_TIMEZONE): Promise<string> {
-  const stored = (await env.SNAPSHOTS.get<StoredState>("state", "json")) ?? {
-    fetchedAt: "",
-    mainList: EMPTY_SECTION,
-    preOrders: EMPTY_SECTION,
-  };
-  const isBaseline = stored.fetchedAt === "";
+async function runCheck(
+  env: Env,
+  timeZone: string = env.DEFAULT_TIMEZONE,
+  accept = false,
+): Promise<string> {
+  const read = await readState(env);
+  if (read.kind === "error") return failStep(env, "state", read.message);
 
-  let images: DiscoveredImages;
+  let current: Catalog;
   try {
-    images = await discoverImages(env);
+    current = parseWholesale(await fetchList(env));
   } catch (e) {
-    const msg = `Login/navigation failed: ${(e as Error).message}`;
-    console.log(msg);
-    await notify(env, "PokeHive watch: login failed", `WARNING\n${msg}`);
-    return msg;
-  }
-
-  const mainListIds = images.mainList.map(imageFilename);
-  const preOrdersId = imageFilename(images.preOrders);
-
-  const mainListChanged =
-    mainListIds[0] !== stored.mainList.imageIds[0] ||
-    mainListIds[1] !== stored.mainList.imageIds[1];
-  const preOrdersChanged = preOrdersId !== stored.preOrders.imageIds[0];
-
-  const extractionErrors: string[] = [];
-  let mainListSection = stored.mainList;
-  let preOrdersSection = stored.preOrders;
-
-  if (mainListChanged) {
-    try {
-      const [part1, part2] = await Promise.all([
-        extractCatalog(env, images.mainList[0], EXTRACTION_PROMPT_MAIN),
-        extractCatalog(env, images.mainList[1], EXTRACTION_PROMPT_MAIN),
-      ]);
-      mainListSection = { imageIds: mainListIds, products: { ...part1, ...part2 } };
-    } catch (e) {
-      extractionErrors.push(`Main List: ${(e as Error).message}`);
-    }
-  }
-
-  if (preOrdersChanged) {
-    try {
-      const products = await extractCatalog(env, images.preOrders, EXTRACTION_PROMPT_PRE_ORDERS);
-      preOrdersSection = { imageIds: [preOrdersId], products };
-    } catch (e) {
-      extractionErrors.push(`Pre-Orders: ${(e as Error).message}`);
-    }
-  }
-
-  if (extractionErrors.length > 0) {
-    const msg = extractionErrors.join("\n");
-    console.log(msg);
-    await notify(env, "PokeHive watch: extraction failed", `WARNING\n${msg}`);
+    if (e instanceof SessionError) return failStep(env, "session", e.message);
+    if (e instanceof ParseError) return failStep(env, "parse", e.message);
+    return failStep(env, "page-load", (e as Error).message);
   }
 
   const nowDate = new Date();
   const now = nowDate.toISOString();
-  const newState: StoredState = {
-    fetchedAt: now,
-    mainList: mainListSection,
-    preOrders: preOrdersSection,
-    lastChangeDate: stored.lastChangeDate,
-  };
-  const saveState = () => env.SNAPSHOTS.put("state", JSON.stringify(newState));
+  const today = dateStringInTimeZone(nowDate, env.DEFAULT_TIMEZONE);
+  const previous = read.kind === "ok" ? read.state : null;
 
-  if (isBaseline) {
-    await saveState();
-    const count =
-      Object.keys(mainListSection.products).length + Object.keys(preOrdersSection.products).length;
-    await notify(
+  const saveBaseline = async (): Promise<string> => {
+    const state: StoredState = {
+      schema: 2,
+      fetchedAt: now,
+      lastChangeDate: previous?.lastChangeDate,
+      sections: current,
+    };
+    await env.SNAPSHOTS.put("state", JSON.stringify(state));
+    const delivered = await notify(
       env,
-      "PokeHive watch started",
-      `Tracking ${count} products (${Object.keys(mainListSection.products).length} main list, ${Object.keys(preOrdersSection.products).length} pre-orders) on ${env.SOURCE_URL}`,
+      "PokeHive watch restarted",
+      `Tracking ${totalItems(current)} items:\n${formatCounts(current)}`,
     );
-    return `Baseline stored: ${count} products.`;
+    if (!delivered) console.log("baseline notification was not delivered");
+    await clearErrorAlert(env);
+    return `Baseline stored: ${totalItems(current)} items.`;
+  };
+
+  if (!previous) return saveBaseline();
+
+  const suspect = suspectReason(previous.sections, current);
+  if (suspect) {
+    if (accept) return saveBaseline();
+    return failStep(env, "suspect", suspect);
   }
 
-  const mainDiff = diffCatalogs(stored.mainList.products, mainListSection.products);
-  const preOrdersDiff = diffCatalogs(stored.preOrders.products, preOrdersSection.products);
+  const diffs = diffCatalogs(previous.sections, current);
+  const changeCount = countChanges(diffs);
+  const newState: StoredState = {
+    schema: 2,
+    fetchedAt: now,
+    lastChangeDate: previous.lastChangeDate,
+    sections: current,
+  };
 
-  const sections: string[] = [];
-  if (!isDiffEmpty(mainDiff)) sections.push(formatDiffSection("Main List", mainDiff));
-  if (!isDiffEmpty(preOrdersDiff)) sections.push(formatDiffSection("Pre-Orders", preOrdersDiff));
-
-  if (sections.length === 0) {
-    await saveState();
-    const count = Object.keys(mainListSection.products).length;
-    return `No changes. ${count} main-list products checked at ${formatTimestamp(now, timeZone)}.`;
+  if (changeCount === 0) {
+    await env.SNAPSHOTS.put("state", JSON.stringify(newState));
+    await clearErrorAlert(env);
+    return `No changes. ${totalItems(current)} items checked at ${formatTimestamp(now, timeZone)}.`;
   }
-
-  const changeCount =
-    mainDiff.added.length +
-    mainDiff.removed.length +
-    mainDiff.priceChanges.length +
-    preOrdersDiff.added.length +
-    preOrdersDiff.removed.length +
-    preOrdersDiff.priceChanges.length;
 
   const delivered = await notify(
     env,
     `PokeHive Wholesale: ${changeCount} change${changeCount === 1 ? "" : "s"}`,
-    sections.join("\n\n"),
+    formatDiff(diffs),
   );
   if (!delivered) {
     // Keep the old snapshot so the next run re-detects and re-sends these changes.
-    const msg = `${changeCount} changes found but the Pushover notification was NOT delivered; snapshot not advanced, will retry next run.`;
-    console.log(msg);
-    await notifyError(env, "PokeHive watch: notification failed", msg);
-    return msg;
+    return failStep(
+      env,
+      "delivery",
+      `${changeCount} changes found but the Pushover notification was NOT delivered; snapshot not advanced, will retry next run.`,
+    );
   }
-  // A change was successfully notified — no need to keep polling today.
-  newState.lastChangeDate = dateStringInTimeZone(nowDate, env.DEFAULT_TIMEZONE);
-  await saveState();
-
+  // A change was successfully notified; no need to keep polling today.
+  newState.lastChangeDate = today;
+  await env.SNAPSHOTS.put("state", JSON.stringify(newState));
+  await clearErrorAlert(env);
   return `${changeCount} changes found and notified at ${formatTimestamp(now, timeZone)}.`;
 }
 
@@ -591,13 +412,13 @@ export default {
     ctx.waitUntil(
       (async () => {
         const today = dateStringInTimeZone(now, env.DEFAULT_TIMEZONE);
-        const stored = await env.SNAPSHOTS.get<StoredState>("state", "json");
-        if (stored?.lastChangeDate === today) {
+        const read = await readState(env);
+        if (read.kind === "ok" && read.state.lastChangeDate === today) {
           console.log(`Skipping check: a change was already found and notified today (${today}).`);
           return;
         }
         await runCheck(env).catch(async (e) => {
-          const msg = `Unhandled error in scheduled check: ${(e as Error).stack ?? e}`;
+          const msg = `Unhandled error in scheduled check: ${(e as Error).message}`;
           console.log(msg);
           await notifyError(env, "PokeHive watch: check crashed", msg);
         });
@@ -623,17 +444,25 @@ export default {
     }
 
     if (url.pathname === "/run") {
-      const summary = await runCheck(env, timeZone);
+      const summary = await runCheck(env, timeZone, url.searchParams.get("accept") === "1");
       return new Response(summary, { headers: { "content-type": "text/plain" } });
     }
 
     if (url.pathname === "/") {
-      const stored = await env.SNAPSHOTS.get<StoredState>("state", "json");
-      const body = stored
-        ? `Last checked: ${formatTimestamp(stored.fetchedAt, timeZone)}\n` +
-          `Main list products: ${Object.keys(stored.mainList.products).length}\n` +
-          `Pre-order products: ${Object.keys(stored.preOrders.products).length}`
-        : "No snapshot yet — hit /run to take the first one.";
+      const read = await readState(env);
+      let body: string;
+      if (read.kind === "ok") {
+        body =
+          `Last checked: ${formatTimestamp(read.state.fetchedAt, timeZone)}\n` +
+          `Items: ${totalItems(read.state.sections)}\n` +
+          formatCounts(read.state.sections);
+      } else if (read.kind === "error") {
+        body = `Stored state is unreadable: ${read.message}`;
+      } else if (read.kind === "migration") {
+        body = "Legacy snapshot found; hit /run to take a new baseline.";
+      } else {
+        body = "No snapshot yet; hit /run to take the first one.";
+      }
       return new Response(body, { headers: { "content-type": "text/plain" } });
     }
 
