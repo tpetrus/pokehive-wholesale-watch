@@ -101,7 +101,7 @@ Renew the same way when a `session` alert arrives.
 
 ## Notifications
 
-Alerts go through the [Pushover](https://pushover.net) app on your phone.
+Alerts go through the [Pushover](https://pushover.net) app.
 Messages are capped at 1024 characters, so long change lists are split into
 several messages titled "(1/3)", "(2/3)", and so on.
 
