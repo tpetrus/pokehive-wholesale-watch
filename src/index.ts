@@ -172,6 +172,31 @@ class PageLoadError extends Error {}
 const BROWSER_UA =
   "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36";
 
+const FETCH_ATTEMPTS = 4;
+const FETCH_BASE_DELAY_MS = 5_000;
+const FETCH_MAX_DELAY_MS = 60_000;
+
+function isRetryableStatus(status: number): boolean {
+  return status === 429 || status >= 500;
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((r) => setTimeout(r, ms));
+}
+
+/** Delay before retry `attempt` (1-based): Retry-After if given, else 5s/10s/20s plus jitter. */
+function backoffMs(attempt: number, retryAfter: string | null): number {
+  if (retryAfter) {
+    const secs = Number(retryAfter);
+    const ms = Number.isFinite(secs)
+      ? secs * 1000
+      : Date.parse(retryAfter) - Date.now(); // HTTP-date form
+    if (Number.isFinite(ms) && ms >= 0) return Math.min(ms, FETCH_MAX_DELAY_MS);
+  }
+  const exp = FETCH_BASE_DELAY_MS * 2 ** (attempt - 1);
+  return Math.min(exp + Math.floor(Math.random() * 1000), FETCH_MAX_DELAY_MS);
+}
+
 async function fetchList(env: Env): Promise<unknown> {
   let url: URL;
   try {
@@ -192,17 +217,35 @@ async function fetchList(env: Env): Promise<unknown> {
   // and the request below goes to exactly that URL.
   if (cookie) headers.Cookie = cookie;
 
-  let res: Response;
-  try {
-    res = await fetch(url.toString(), { method: "GET", headers, redirect: "manual" });
-  } catch (e) {
-    // Never forward e.message: runtime errors can quote header values (the cookie).
-    throw new PageLoadError(`Network error (${e instanceof Error ? e.name : "unknown"})`);
+  // Shopify rate-limits by IP and Workers egress from shared Cloudflare IPs, so
+  // an occasional 429 (or 5xx) is expected. Retry those with backoff, honoring
+  // Retry-After, before treating the run as a page-load failure.
+  let res: Response | undefined;
+  for (let attempt = 1; attempt <= FETCH_ATTEMPTS; attempt++) {
+    try {
+      res = await fetch(url.toString(), { method: "GET", headers, redirect: "manual" });
+    } catch (e) {
+      // Never forward e.message: runtime errors can quote header values (the cookie).
+      if (attempt < FETCH_ATTEMPTS) {
+        await sleep(backoffMs(attempt, null));
+        continue;
+      }
+      throw new PageLoadError(`Network error (${e instanceof Error ? e.name : "unknown"})`);
+    }
+    if (!isRetryableStatus(res.status) || attempt === FETCH_ATTEMPTS) break;
+    const wait = backoffMs(attempt, res.headers.get("Retry-After"));
+    console.log(`list fetch got HTTP ${res.status} (attempt ${attempt}); retrying in ${wait}ms`);
+    await res.body?.cancel();
+    await sleep(wait);
   }
+  res = res!;
   if (res.status >= 300 && res.status < 400) {
     throw new SessionError(`Redirected (HTTP ${res.status}); the session cookie is likely expired`);
   }
-  if (!res.ok) throw new PageLoadError(`HTTP ${res.status}`);
+  if (!res.ok) {
+    const note = res.status === 429 ? " (rate limited; still failing after retries)" : "";
+    throw new PageLoadError(`HTTP ${res.status}${note}`);
+  }
   try {
     return JSON.parse(await res.text());
   } catch {

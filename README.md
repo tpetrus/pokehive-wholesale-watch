@@ -63,7 +63,7 @@ that record. A failure never overwrites the stored snapshot.
 | Step | Meaning |
 | --- | --- |
 | `session` | The response was the logged-out view, or the server redirected. Renew the cookie (below). The alert includes the renewal steps. |
-| `page-load` | Non-2xx response, network error, or a body that is not JSON. |
+| `page-load` | Non-2xx response, network error, or a body that is not JSON. HTTP 429, 5xx and network errors are retried up to 3 times (4 attempts, honoring `Retry-After`, about 35s of backoff by default) before alerting. |
 | `parse` | The JSON did not have the expected shape. |
 | `suspect` | The result looks partial versus the last snapshot: a previously seen section is missing, any section lost more than 50% of its items, or the total dropped by more than 30%. The alert lists the counts. If the change is real, hit `/run?accept=1` (with the run key). |
 | `state` | The stored snapshot is unreadable (KV error or unrecognized shape). The Worker stops rather than re-baselining. |
